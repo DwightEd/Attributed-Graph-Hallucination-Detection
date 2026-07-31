@@ -1,0 +1,10 @@
+{
+  "phase": "done",
+  "round": 1,
+  "threadId": null,
+  "last_score": 8.5,
+  "last_verdict": "REVISE",
+  "status": "completed",
+  "timestamp": "2026-07-31T10:52:32+08:00",
+  "note": "Best-current proposal completed. External GPT-5.5 reviewer backend was unavailable; final score is a local assessment."
+}
