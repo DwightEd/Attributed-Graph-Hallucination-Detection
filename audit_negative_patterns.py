@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
 import re
 from collections import Counter, defaultdict
@@ -131,8 +132,12 @@ EPISTEMIC_RE = re.compile(
 )
 ENTITY_BINDING_RE = re.compile(
     r"\b(?:net worth|attribute(?:d)? to|assigned to|belongs? to|"
-    r"refers? to|instead of|whose|subject|entity|person|name)\b",
+    r"refers? to|instead of|whose)\b",
     re.IGNORECASE,
+)
+GENERATED_SECTION_RE = re.compile(
+    r"\b(?:generated|generative|aigc)\s*:\s*(.*)",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -163,21 +168,29 @@ def classify_error_pattern(label: Mapping[str, Any]) -> dict[str, Any]:
     meta = str(label.get("meta") or "")
     searchable = f"{text}\n{meta}"
     support_relation, severity = _label_axes(label_type)
+    generated_section = GENERATED_SECTION_RE.search(meta)
+    mechanism_text = (
+        f"{text}\n{generated_section.group(1)}"
+        if support_relation == "baseless" and generated_section
+        else text
+        if support_relation == "baseless"
+        else searchable
+    )
     tags: set[str] = set()
 
     if support_relation == "baseless":
         tags.add("unsupported_addition")
     if support_relation == "conflict":
         tags.add("relation_predicate")
-    if SOURCE_ATTRIBUTION_RE.search(searchable):
+    if SOURCE_ATTRIBUTION_RE.search(mechanism_text):
         tags.add("source_attribution")
-    if ENTITY_BINDING_RE.search(searchable):
+    if ENTITY_BINDING_RE.search(mechanism_text):
         tags.add("entity_attribute_binding")
-    if NUMERIC_TEMPORAL_RE.search(searchable):
+    if NUMERIC_TEMPORAL_RE.search(mechanism_text):
         tags.add("numeric_temporal")
-    if POLARITY_RE.search(searchable):
+    if POLARITY_RE.search(mechanism_text):
         tags.add("polarity_negation")
-    if EPISTEMIC_RE.search(searchable):
+    if EPISTEMIC_RE.search(mechanism_text):
         tags.add("epistemic_inference")
     if not tags:
         tags.add("unclassified")
@@ -320,7 +333,19 @@ def audit_dataset(
     responses_path = Path(responses_path)
     sources_path = Path(sources_path)
     sources, malformed_source_rows = _load_sources(sources_path)
-    quality = Counter({"malformed_source_rows": malformed_source_rows})
+    quality = Counter(
+        {
+            "malformed_source_rows": malformed_source_rows,
+            "malformed_response_rows": 0,
+            "missing_source_responses": 0,
+            "non_list_label_fields": 0,
+            "malformed_labels": 0,
+            "invalid_span_bounds": 0,
+            "span_text_mismatches": 0,
+            "unknown_label_types": 0,
+            "overlapping_span_responses": 0,
+        }
+    )
     total = _new_group()
     groups: dict[str, defaultdict[str, dict[str, int]]] = {
         "task": defaultdict(_new_group),
@@ -498,7 +523,11 @@ def audit_dataset(
 
 
 def _markdown_cell(value: Any) -> str:
-    return str(value).replace("|", r"\|").replace("\n", " ")
+    return (
+        html.escape(str(value), quote=False)
+        .replace("|", r"\|")
+        .replace("\n", " ")
+    )
 
 
 def _percent(value: float | int) -> str:
@@ -618,12 +647,15 @@ def _write_csv(
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
-            normalized = {
-                field: " | ".join(str(item) for item in value)
-                if isinstance(value, list)
-                else value
-                for field, value in row.items()
-            }
+            normalized = {}
+            for field, value in row.items():
+                if isinstance(value, list):
+                    value = " | ".join(str(item) for item in value)
+                if isinstance(value, str) and value.lstrip().startswith(
+                    ("=", "+", "-", "@")
+                ):
+                    value = f"'{value}"
+                normalized[field] = value
             writer.writerow(normalized)
 
 

@@ -54,6 +54,29 @@ class ErrorPatternClassificationTests(unittest.TestCase):
 
         self.assertEqual(result["primary_pattern"], "source_attribution")
 
+    def test_annotation_boilerplate_does_not_create_a_false_polarity_pattern(self):
+        label = {
+            "label_type": "Subtle Baseless Info",
+            "text": "a symbol of hope and resilience",
+            "meta": "This specific detail was not mentioned in the source content.",
+        }
+
+        result = classify_error_pattern(label)
+
+        self.assertEqual(result["primary_pattern"], "unsupported_addition")
+        self.assertNotIn("polarity_negation", result["pattern_tags"])
+
+    def test_idiom_containing_name_is_not_an_entity_binding_error(self):
+        label = {
+            "label_type": "Evident Baseless Info",
+            "text": "accumulating over 200 credits to his name",
+            "meta": "This was not mentioned in the source content.",
+        }
+
+        result = classify_error_pattern(label)
+
+        self.assertNotIn("entity_attribute_binding", result["pattern_tags"])
+
 
 class IntervalTests(unittest.TestCase):
     def test_merge_intervals_counts_overlapping_spans_once(self):
@@ -158,6 +181,7 @@ class DatasetAuditTests(unittest.TestCase):
         self.assertEqual(quality["span_text_mismatches"], 2)
         self.assertEqual(quality["overlapping_span_responses"], 1)
         self.assertEqual(quality["unknown_label_types"], 1)
+        self.assertEqual(quality["non_list_label_fields"], 0)
         self.assertEqual(
             result.report["breakdowns"]["primary_pattern"]["numeric_temporal"],
             1,
@@ -200,7 +224,7 @@ class AuditOutputTests(unittest.TestCase):
                             {
                                 "task": "Summary",
                                 "model": "model-a",
-                                "span_text": "2022",
+                                "span_text": '<script>alert("audit")</script>',
                                 "meta": "Original: 1945",
                             }
                         ]
@@ -241,8 +265,8 @@ class AuditOutputTests(unittest.TestCase):
                     "end": 6,
                     "valid_bounds": True,
                     "span_text_matches": True,
-                    "span_text": "2022",
-                    "actual_text": "2022",
+                    "span_text": '=HYPERLINK("https://example.invalid")',
+                    "actual_text": '=HYPERLINK("https://example.invalid")',
                     "meta": "Original: 1945",
                     "context": "X 2022.",
                 }
@@ -258,9 +282,12 @@ class AuditOutputTests(unittest.TestCase):
 
         self.assertEqual(report["summary"]["responses"], 2)
         self.assertIn("numeric_temporal", markdown)
+        self.assertNotIn("<script>", markdown)
+        self.assertIn("&lt;script&gt;", markdown)
         self.assertIn("sample_class", samples_csv)
         self.assertIn("Evident Conflict", spans_csv)
         self.assertIn("numeric_temporal | relation_predicate", spans_csv)
+        self.assertIn("'=HYPERLINK", spans_csv)
 
 
 if __name__ == "__main__":
