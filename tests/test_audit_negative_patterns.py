@@ -4,9 +4,11 @@ import unittest
 from pathlib import Path
 
 from audit_negative_patterns import (
+    AuditResult,
     audit_dataset,
     classify_error_pattern,
     merge_intervals,
+    write_audit_outputs,
 )
 
 
@@ -162,6 +164,103 @@ class DatasetAuditTests(unittest.TestCase):
         )
         self.assertEqual(len(result.sample_rows), 3)
         self.assertEqual(len(result.span_rows), 5)
+
+
+class AuditOutputTests(unittest.TestCase):
+    def test_writer_exports_json_markdown_and_two_csv_granularities(self):
+        result = AuditResult(
+            report={
+                "schema_version": 1,
+                "inputs": {"responses": "responses.jsonl", "sources": "sources.jsonl"},
+                "summary": {
+                    "responses": 2,
+                    "clean_responses": 1,
+                    "hallucinated_responses": 1,
+                    "annotated_spans": 1,
+                    "multi_span_hallucinated_responses": 0,
+                    "response_characters": 20,
+                    "hallucinated_union_characters": 4,
+                    "hallucinated_response_rate": 0.5,
+                    "hallucinated_character_rate": 0.2,
+                    "multi_span_share_of_hallucinated": 0.0,
+                },
+                "data_quality": {"span_text_mismatches": 0},
+                "breakdowns": {
+                    "task": {},
+                    "model": {},
+                    "split": {},
+                    "label_type": {"Evident Conflict": 1},
+                    "primary_pattern": {"numeric_temporal": 1},
+                    "pattern_tag": {"numeric_temporal": 1},
+                    "task_primary_pattern": {},
+                },
+                "examples": {
+                    "by_primary_pattern": {
+                        "numeric_temporal": [
+                            {
+                                "task": "Summary",
+                                "model": "model-a",
+                                "span_text": "2022",
+                                "meta": "Original: 1945",
+                            }
+                        ]
+                    },
+                    "clean_by_task": {},
+                },
+            },
+            sample_rows=[
+                {
+                    "response_id": "1",
+                    "source_id": "s1",
+                    "task": "Summary",
+                    "model": "model-a",
+                    "split": "train",
+                    "quality": "good",
+                    "sample_class": "hallucinated",
+                    "response_characters": 20,
+                    "annotation_count": 1,
+                    "hallucinated_union_characters": 4,
+                    "hallucinated_character_rate": 0.2,
+                    "label_types": ["Evident Conflict"],
+                    "primary_patterns": ["numeric_temporal"],
+                }
+            ],
+            span_rows=[
+                {
+                    "response_id": "1",
+                    "source_id": "s1",
+                    "task": "Summary",
+                    "model": "model-a",
+                    "split": "train",
+                    "label_type": "Evident Conflict",
+                    "support_relation": "conflict",
+                    "severity": "evident",
+                    "primary_pattern": "numeric_temporal",
+                    "pattern_tags": ["numeric_temporal", "relation_predicate"],
+                    "start": 2,
+                    "end": 6,
+                    "valid_bounds": True,
+                    "span_text_matches": True,
+                    "span_text": "2022",
+                    "actual_text": "2022",
+                    "meta": "Original: 1945",
+                    "context": "X 2022.",
+                }
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            paths = write_audit_outputs(result, Path(temporary_directory))
+            report = json.loads(paths["json"].read_text(encoding="utf-8"))
+            markdown = paths["markdown"].read_text(encoding="utf-8")
+            samples_csv = paths["samples_csv"].read_text(encoding="utf-8-sig")
+            spans_csv = paths["spans_csv"].read_text(encoding="utf-8-sig")
+
+        self.assertEqual(report["summary"]["responses"], 2)
+        self.assertIn("numeric_temporal", markdown)
+        self.assertIn("sample_class", samples_csv)
+        self.assertIn("Evident Conflict", spans_csv)
+        self.assertIn("numeric_temporal | relation_predicate", spans_csv)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import csv
 import json
 import re
 from collections import Counter, defaultdict
@@ -17,6 +19,78 @@ KNOWN_LABEL_TYPES = {
     "Subtle Baseless Info",
     "Subtle Conflict",
 }
+
+PATTERN_GUIDANCE = {
+    "source_attribution": (
+        "引用了错误 passage/source",
+        "typed source→claim 边或边重构",
+    ),
+    "entity_attribute_binding": (
+        "实体与属性/数值错误绑定",
+        "entity–slot–value 异构边重构",
+    ),
+    "numeric_temporal": (
+        "数字、日期、时长或数量变化",
+        "数值节点属性重构与 source-copy 对齐",
+    ),
+    "polarity_negation": (
+        "否定、可用性、大小方向等极性反转",
+        "带符号/关系类型的兼容性重构",
+    ),
+    "epistemic_inference": (
+        "可能性、确定性或推断强度发生变化",
+        "claim modality 属性重构",
+    ),
+    "relation_predicate": (
+        "证据存在但谓词或关系不一致",
+        "relation-aware edge compatibility",
+    ),
+    "unsupported_addition": (
+        "生成了来源中没有的信息",
+        "source-support deficit 与 masked claim reconstruction",
+    ),
+    "unclassified": (
+        "现有启发式未覆盖",
+        "人工复核后扩展规则",
+    ),
+}
+
+SAMPLE_FIELDS = (
+    "response_id",
+    "source_id",
+    "task",
+    "model",
+    "split",
+    "quality",
+    "sample_class",
+    "response_characters",
+    "annotation_count",
+    "hallucinated_union_characters",
+    "hallucinated_character_rate",
+    "label_types",
+    "primary_patterns",
+)
+
+SPAN_FIELDS = (
+    "response_id",
+    "source_id",
+    "task",
+    "model",
+    "split",
+    "label_type",
+    "support_relation",
+    "severity",
+    "primary_pattern",
+    "pattern_tags",
+    "start",
+    "end",
+    "valid_bounds",
+    "span_text_matches",
+    "span_text",
+    "actual_text",
+    "meta",
+    "context",
+)
 
 PATTERN_PRIORITY = (
     "source_attribution",
@@ -421,3 +495,220 @@ def audit_dataset(
         },
     }
     return AuditResult(report=report, sample_rows=sample_rows, span_rows=span_rows)
+
+
+def _markdown_cell(value: Any) -> str:
+    return str(value).replace("|", r"\|").replace("\n", " ")
+
+
+def _percent(value: float | int) -> str:
+    return f"{float(value) * 100:.2f}%"
+
+
+def render_markdown_report(report: Mapping[str, Any]) -> str:
+    """Render a human-readable audit report from the JSON-compatible report."""
+
+    summary = report["summary"]
+    breakdowns = report["breakdowns"]
+    lines = [
+        "# RAGTruth 正负样本错误模式审计",
+        "",
+        "> `clean` 表示没有人工标注 hallucination span；`hallucinated` 表示至少有一个标注 span。"
+        "错误机制是用于研究审计的可解释启发式标签，不应作为训练标签。",
+        "",
+        "## 总体分布",
+        "",
+        "| 指标 | 数值 |",
+        "|---|---:|",
+        f"| 回答总数 | {summary['responses']} |",
+        f"| clean 回答 | {summary['clean_responses']} |",
+        f"| hallucinated 回答 | {summary['hallucinated_responses']} |",
+        f"| 回答级幻觉比例 | {_percent(summary['hallucinated_response_rate'])} |",
+        f"| 标注 span 数 | {summary['annotated_spans']} |",
+        f"| 错误字符覆盖率 | {_percent(summary['hallucinated_character_rate'])} |",
+        f"| 多错误回答占 hallucinated 比例 | "
+        f"{_percent(summary['multi_span_share_of_hallucinated'])} |",
+        "",
+        "## 按任务分布",
+        "",
+        "| 任务 | 回答数 | clean | hallucinated | 回答级比例 | 错误字符覆盖率 |",
+        "|---|---:|---:|---:|---:|---:|",
+    ]
+    for task, values in breakdowns["task"].items():
+        lines.append(
+            f"| {_markdown_cell(task)} | {values['responses']} | "
+            f"{values['clean_responses']} | {values['hallucinated_responses']} | "
+            f"{_percent(values['hallucinated_response_rate'])} | "
+            f"{_percent(values['hallucinated_character_rate'])} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## 官方标注类型",
+            "",
+            "| 标签 | span 数 |",
+            "|---|---:|",
+        ]
+    )
+    for label_type, count in breakdowns["label_type"].items():
+        lines.append(f"| {_markdown_cell(label_type)} | {count} |")
+
+    lines.extend(
+        [
+            "",
+            "## 具体错误机制",
+            "",
+            "| 主模式 | span 数 | 审计含义 | 对应图建模假设 |",
+            "|---|---:|---|---|",
+        ]
+    )
+    for pattern, count in sorted(
+        breakdowns["primary_pattern"].items(),
+        key=lambda item: (-item[1], item[0]),
+    ):
+        meaning, graph_hypothesis = PATTERN_GUIDANCE.get(
+            pattern, PATTERN_GUIDANCE["unclassified"]
+        )
+        lines.append(
+            f"| `{pattern}` | {count} | {meaning} | {graph_hypothesis} |"
+        )
+
+    lines.extend(["", "## 数据质量检查", "", "| 检查项 | 数量 |", "|---|---:|"])
+    quality = report.get("data_quality", {})
+    if quality:
+        for name, count in quality.items():
+            lines.append(f"| `{name}` | {count} |")
+    else:
+        lines.append("| 未发现结构问题 | 0 |")
+
+    lines.extend(["", "## 代表性负样本", ""])
+    pattern_examples = report["examples"]["by_primary_pattern"]
+    for pattern, examples in pattern_examples.items():
+        lines.extend([f"### `{pattern}`", ""])
+        for example in examples:
+            span = _markdown_cell(example.get("span_text", ""))
+            meta = _markdown_cell(example.get("meta", ""))
+            task = _markdown_cell(example.get("task", ""))
+            model = _markdown_cell(example.get("model", ""))
+            lines.append(f"- `{task}` / `{model}` — **{span}**：{meta}")
+        lines.append("")
+
+    lines.extend(
+        [
+            "## 使用边界",
+            "",
+            "- 官方 `label_type` 用于评价和审计，不进入无监督训练。",
+            "- `primary_pattern` 是互斥的便捷汇总；`pattern_tags` 保留一个 span 的多种机制。",
+            "- 启发式规则只能用于发现数据模式和制定消融实验，不能替代人工事实核验。",
+            "- 高回答级污染与低 span 覆盖率并存，因此优先做 token/claim 局部异常检测。",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _write_csv(
+    path: Path,
+    rows: Iterable[Mapping[str, Any]],
+    fieldnames: Iterable[str],
+) -> None:
+    fieldnames = tuple(fieldnames)
+    with path.open("w", encoding="utf-8-sig", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            normalized = {
+                field: " | ".join(str(item) for item in value)
+                if isinstance(value, list)
+                else value
+                for field, value in row.items()
+            }
+            writer.writerow(normalized)
+
+
+def write_audit_outputs(
+    result: AuditResult,
+    output_directory: str | Path,
+) -> dict[str, Path]:
+    """Write machine-readable and human-readable audit artifacts."""
+
+    output_directory = Path(output_directory)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "json": output_directory / "audit_report.json",
+        "markdown": output_directory / "audit_report.md",
+        "samples_csv": output_directory / "sample_audit.csv",
+        "spans_csv": output_directory / "span_audit.csv",
+    }
+    paths["json"].write_text(
+        json.dumps(result.report, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    paths["markdown"].write_text(
+        render_markdown_report(result.report),
+        encoding="utf-8",
+    )
+    _write_csv(paths["samples_csv"], result.sample_rows, SAMPLE_FIELDS)
+    _write_csv(paths["spans_csv"], result.span_rows, SPAN_FIELDS)
+    return paths
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    project_root = Path(__file__).resolve().parent
+    dataset_root = project_root / "Datasets" / "RAGTruth"
+    parser = argparse.ArgumentParser(
+        description=(
+            "Audit clean and hallucinated RAGTruth responses, concrete error "
+            "mechanisms, span integrity, and task/model distributions."
+        )
+    )
+    parser.add_argument(
+        "--responses",
+        type=Path,
+        default=dataset_root / "response.jsonl",
+        help="Path to response.jsonl.",
+    )
+    parser.add_argument(
+        "--sources",
+        type=Path,
+        default=dataset_root / "source_info.jsonl",
+        help="Path to source_info.jsonl.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=project_root / "audit_outputs" / "ragtruth_patterns",
+        help="Directory for JSON, Markdown, and CSV outputs.",
+    )
+    parser.add_argument(
+        "--max-examples",
+        type=int,
+        default=5,
+        help="Maximum representative examples stored for each pattern/task.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_argument_parser().parse_args(argv)
+    if args.max_examples < 0:
+        raise SystemExit("--max-examples must be non-negative")
+    result = audit_dataset(
+        args.responses,
+        args.sources,
+        max_examples=args.max_examples,
+    )
+    paths = write_audit_outputs(result, args.output_dir)
+    summary = result.report["summary"]
+    print(
+        f"Audited {summary['responses']} responses and "
+        f"{summary['annotated_spans']} annotated spans."
+    )
+    for name, path in paths.items():
+        print(f"{name}: {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
