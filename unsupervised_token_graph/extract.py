@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Sequence
 import hashlib
+import json
+from pathlib import Path
 
 import numpy as np
 import torch
 
-from .data import TokenGraphExample
+from .data import TokenGraphExample, read_prepared_examples
 from .features import summarize_attention_trace
+from .graph import build_token_graph
 from .trace import assign_segment_ids
 
 
@@ -185,6 +189,10 @@ def summarize_trace_record(trace: dict[str, object]) -> dict[str, object]:
         "example_id": str(trace["example_id"]),
         "pair_id": str(trace.get("pair_id", trace["example_id"])),
         "dataset": str(trace.get("dataset", "unknown")),
+        "token_count": int(len(segment_ids)),
+        "passage_token_count": int((segment_ids == 1).sum()),
+        "question_token_count": int((segment_ids == 2).sum()),
+        "answer_token_count": int((segment_ids == 3).sum()),
     }
     for name, value in summary.items():
         record[name] = _scalar(value)
@@ -208,3 +216,205 @@ def summarize_trace_record(trace: dict[str, object]) -> dict[str, object]:
             values = torch.as_tensor(trace["next_token_entropy"], dtype=torch.float32)
             record["mean_answer_next_token_entropy"] = float(values[selected].mean())
     return record
+
+
+def resolve_probe_layers(num_hidden_layers: int, num_probes: int = 6) -> tuple[int, ...]:
+    """Choose hidden-state outputs from 25% depth through the final layer."""
+
+    if num_hidden_layers < 1 or num_probes < 1:
+        raise ValueError("layer and probe counts must be positive")
+    first = max(1, round(num_hidden_layers * 0.25))
+    values = np.linspace(first, num_hidden_layers, num_probes)
+    return tuple(sorted({int(round(value)) for value in values}))
+
+
+def _fingerprint(
+    example: TokenGraphExample,
+    model_id: str,
+    selected_layers: Sequence[int],
+    tau: float,
+    include_hidden_nodes: bool,
+) -> str:
+    payload = json.dumps(
+        {
+            "schema": "token_trace_v1",
+            "text": example.text,
+            "model": model_id,
+            "layers": list(selected_layers),
+            "tau": tau,
+            "include_hidden_nodes": include_hidden_nodes,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _atomic_torch_save(value, path: Path) -> None:
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(value, temporary_path)
+    temporary_path.replace(path)
+
+
+def extract_prepared_dataset(
+    model,
+    tokenizer,
+    examples: Sequence[TokenGraphExample],
+    *,
+    output_dir: str | Path,
+    model_id: str,
+    selected_hidden_layers: Sequence[int],
+    max_tokens: int | None,
+    tau: float,
+    include_prefix_edges: bool,
+    include_hidden_nodes: bool,
+    overwrite: bool = False,
+) -> dict[str, object]:
+    """Extract traces, token graphs, and scalar pattern features without labels."""
+
+    output_directory = Path(output_dir)
+    trace_directory = output_directory / "traces"
+    graph_directory = output_directory / "graphs"
+    trace_directory.mkdir(parents=True, exist_ok=True)
+    graph_directory.mkdir(parents=True, exist_ok=True)
+    feature_records = []
+    for position, example in enumerate(examples, start=1):
+        trace_path = trace_directory / f"{example.example_id}.pt"
+        graph_path = graph_directory / f"{example.example_id}.pt"
+        fingerprint = _fingerprint(
+            example,
+            model_id,
+            selected_hidden_layers,
+            tau,
+            include_hidden_nodes,
+        )
+        if trace_path.exists() and graph_path.exists() and not overwrite:
+            trace = torch.load(trace_path, map_location="cpu", weights_only=False)
+            if trace.get("extraction_fingerprint") != fingerprint:
+                raise RuntimeError(
+                    f"Stale extraction cache for {example.example_id}; use --overwrite"
+                )
+        else:
+            trace = extract_example_trace(
+                model,
+                tokenizer,
+                example,
+                selected_hidden_layers=selected_hidden_layers,
+                max_tokens=max_tokens,
+            )
+            trace["extractor_model_id"] = model_id
+            trace["extraction_fingerprint"] = fingerprint
+            graph = build_token_graph(
+                trace["input_ids"],
+                trace["attention"],
+                trace["segment_ids"],
+                hidden_states=(trace["hidden_states"] if include_hidden_nodes else None),
+                token_log_probs=trace["token_log_prob"],
+                next_token_entropy=trace["next_token_entropy"],
+                tau=tau,
+                include_prefix_edges=include_prefix_edges,
+            )
+            graph.update(
+                {
+                    "example_id": example.example_id,
+                    "pair_id": example.pair_id,
+                    "dataset": example.dataset,
+                    "extractor_model_id": model_id,
+                    "extraction_fingerprint": fingerprint,
+                }
+            )
+            stored_trace = dict(trace)
+            stored_trace["attention"] = trace["attention"].half()
+            stored_trace["hidden_states"] = trace["hidden_states"].half()
+            _atomic_torch_save(stored_trace, trace_path)
+            _atomic_torch_save(graph, graph_path)
+        feature_records.append(summarize_trace_record(trace))
+        if position == 1 or position % 25 == 0 or position == len(examples):
+            print(f"Extracted {position}/{len(examples)} token graphs")
+
+    feature_path = output_directory / "features.jsonl"
+    feature_path.write_text(
+        "\n".join(
+            json.dumps(record, ensure_ascii=False, sort_keys=True)
+            for record in feature_records
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "state": "complete",
+        "examples": len(examples),
+        "model_id": model_id,
+        "selected_hidden_layers": list(selected_hidden_layers),
+        "max_tokens": max_tokens,
+        "tau": tau,
+        "include_prefix_edges": include_prefix_edges,
+        "include_hidden_nodes": include_hidden_nodes,
+        "trace_dir": str(trace_directory),
+        "graph_dir": str(graph_directory),
+        "features": str(feature_path),
+    }
+    (output_directory / "extraction_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Extract label-free token graphs.")
+    parser.add_argument("--examples", required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--max-tokens", type=int)
+    parser.add_argument("--probe-layers", help="Comma-separated hidden-state indices")
+    parser.add_argument("--tau", type=float, default=0.05)
+    parser.add_argument("--drop-prefix-edges", action="store_true")
+    parser.add_argument("--include-hidden-nodes", action="store_true")
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--dtype", choices=("float16", "bfloat16", "float32"), default="float16"
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    dtype = getattr(torch, args.dtype)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        torch_dtype=dtype,
+        attn_implementation="eager",
+    ).to(args.device)
+    model.eval()
+    examples = read_prepared_examples(args.examples)
+    if args.limit is not None:
+        examples = examples[: args.limit]
+    if args.probe_layers:
+        probe_layers = tuple(int(value) for value in args.probe_layers.split(","))
+    else:
+        probe_layers = resolve_probe_layers(int(model.config.num_hidden_layers))
+    manifest = extract_prepared_dataset(
+        model,
+        tokenizer,
+        examples,
+        output_dir=args.output_dir,
+        model_id=args.model,
+        selected_hidden_layers=probe_layers,
+        max_tokens=args.max_tokens,
+        tau=args.tau,
+        include_prefix_edges=not args.drop_prefix_edges,
+        include_hidden_nodes=args.include_hidden_nodes,
+        overwrite=args.overwrite,
+    )
+    print(json.dumps(manifest, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -230,6 +230,43 @@ def write_prepared_dataset(
     return {"examples": example_path, "evaluation_labels": label_path}
 
 
+def read_prepared_examples(path: str | Path) -> list[TokenGraphExample]:
+    """Read the label-free examples file without opening its label sidecar."""
+
+    examples = []
+    for row in _read_records(path):
+        spans = {
+            name: (int(span[0]), int(span[1]))
+            for name, span in row["segment_char_spans"].items()
+        }
+        examples.append(
+            TokenGraphExample(
+                example_id=str(row["example_id"]),
+                pair_id=str(row["pair_id"]),
+                dataset=str(row["dataset"]),
+                passage=str(row["passage"]),
+                question=str(row["question"]),
+                answer=str(row["answer"]),
+                text=str(row["text"]),
+                segment_char_spans=spans,
+                metadata=dict(row.get("metadata", {})),
+            )
+        )
+    return examples
+
+
+def read_evaluation_labels(path: str | Path) -> dict[str, int]:
+    """Read labels only from an explicit evaluation call site."""
+
+    labels = {}
+    for row in _read_records(path):
+        label = int(row["label"])
+        if label not in (0, 1):
+            raise ValueError("evaluation labels must be binary")
+        labels[str(row["example_id"])] = label
+    return labels
+
+
 def deterministic_split(
     examples: list[TokenGraphExample],
     *,

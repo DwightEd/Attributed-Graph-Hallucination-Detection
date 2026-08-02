@@ -67,3 +67,39 @@ def summarize_feature_separation(
             "separability": float(max(auc, 1.0 - auc)),
         }
     return summary
+
+
+def summarize_paired_ranking(
+    records: Sequence[Mapping[str, object]],
+    evaluation_labels: Mapping[str, int],
+    *,
+    score_field: str = "anomaly_score",
+) -> dict[str, float | int]:
+    """Measure whether the error candidate outranks its correct paired answer."""
+
+    grouped: dict[str, list[Mapping[str, object]]] = {}
+    for record in records:
+        grouped.setdefault(str(record["pair_id"]), []).append(record)
+    wins = ties = evaluated = 0
+    for pair_records in grouped.values():
+        correct_scores = []
+        error_scores = []
+        for record in pair_records:
+            example_id = str(record["example_id"])
+            if example_id not in evaluation_labels:
+                continue
+            destination = error_scores if evaluation_labels[example_id] == 1 else correct_scores
+            destination.append(float(record[score_field]))
+        if not correct_scores or not error_scores:
+            continue
+        evaluated += 1
+        correct_score = float(np.mean(correct_scores))
+        error_score = float(np.mean(error_scores))
+        wins += int(error_score > correct_score)
+        ties += int(error_score == correct_score)
+    return {
+        "evaluated_pairs": evaluated,
+        "wins": wins,
+        "ties": ties,
+        "paired_ranking_accuracy": float((wins + 0.5 * ties) / max(evaluated, 1)),
+    }
