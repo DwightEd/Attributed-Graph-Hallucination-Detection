@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from dataclasses import asdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -164,3 +165,93 @@ def load_boolq_predictions(
         )
         evaluation_labels[example_id] = int(predicted_bool != gold_bool)
     return examples, evaluation_labels
+
+
+_FORBIDDEN_EVALUATION_KEYS = {
+    "candidate",
+    "candidate_role",
+    "candidate_type",
+    "correct_candidate",
+    "gold_answer",
+    "is_correct",
+    "is_hallucinated",
+    "label",
+    "labels",
+    "target",
+    "y",
+    "y_token",
+}
+
+
+def _remove_evaluation_fields(value):
+    if isinstance(value, Mapping):
+        return {
+            key: _remove_evaluation_fields(nested)
+            for key, nested in value.items()
+            if key.casefold() not in _FORBIDDEN_EVALUATION_KEYS
+        }
+    if isinstance(value, (list, tuple)):
+        return [_remove_evaluation_fields(nested) for nested in value]
+    return value
+
+
+def write_prepared_dataset(
+    examples: list[TokenGraphExample],
+    evaluation_labels: Mapping[str, int],
+    output_dir: str | Path,
+) -> dict[str, Path]:
+    """Write label-free model inputs and a physically separate label sidecar."""
+
+    output_directory = Path(output_dir)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    example_ids = {example.example_id for example in examples}
+    if set(evaluation_labels) != example_ids:
+        raise ValueError("evaluation labels must match the prepared example ids")
+    example_path = output_directory / "examples.jsonl"
+    label_path = output_directory / "evaluation_labels.jsonl"
+    example_lines = [
+        json.dumps(
+            _remove_evaluation_fields(asdict(example)),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        for example in examples
+    ]
+    label_lines = [
+        json.dumps(
+            {"example_id": example.example_id, "label": int(evaluation_labels[example.example_id])},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        for example in examples
+    ]
+    example_path.write_text("\n".join(example_lines) + "\n", encoding="utf-8")
+    label_path.write_text("\n".join(label_lines) + "\n", encoding="utf-8")
+    return {"examples": example_path, "evaluation_labels": label_path}
+
+
+def deterministic_split(
+    examples: list[TokenGraphExample],
+    *,
+    train_fraction: float,
+    seed: int,
+) -> tuple[list[TokenGraphExample], list[TokenGraphExample]]:
+    """Split by pair id so paired candidates can never cross partitions."""
+
+    if not 0.0 < train_fraction < 1.0:
+        raise ValueError("train_fraction must be between zero and one")
+    pair_ids = sorted({example.pair_id for example in examples})
+    if len(pair_ids) < 2:
+        raise ValueError("at least two pair groups are required")
+    ordered_pairs = sorted(
+        pair_ids,
+        key=lambda pair_id: _stable_id(str(seed), pair_id),
+    )
+    train_count = min(
+        len(pair_ids) - 1,
+        max(1, round(len(pair_ids) * train_fraction)),
+    )
+    train_pairs = set(ordered_pairs[:train_count])
+    train = [example for example in examples if example.pair_id in train_pairs]
+    test = [example for example in examples if example.pair_id not in train_pairs]
+    return train, test
