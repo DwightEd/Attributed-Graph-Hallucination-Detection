@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 from pathlib import Path
+import platform
 
 
 _MODEL_FILE_SUFFIXES = {
@@ -38,7 +40,19 @@ def model_source_signature(source: str | Path, model=None, tokenizer=None) -> st
     """Fingerprint checkpoint/tokenizer provenance without hashing multi-GB weights."""
 
     source_path = Path(source).expanduser()
-    payload: dict[str, object] = {"source": str(source)}
+    package_versions = {}
+    for package_name in ("torch", "transformers", "tokenizers", "safetensors"):
+        try:
+            package_versions[package_name] = importlib.metadata.version(package_name)
+        except importlib.metadata.PackageNotFoundError:
+            package_versions[package_name] = None
+    payload: dict[str, object] = {
+        "source": str(source),
+        "runtime": {
+            "python": platform.python_version(),
+            "packages": package_versions,
+        },
+    }
     if source_path.exists():
         resolved = source_path.resolve()
         payload["resolved_source"] = str(resolved)
@@ -58,8 +72,17 @@ def model_source_signature(source: str | Path, model=None, tokenizer=None) -> st
         config = getattr(model, "config", None)
         if config is not None:
             payload["model_commit"] = getattr(config, "_commit_hash", None)
+            payload["attention_implementation"] = getattr(
+                config, "_attn_implementation", None
+            )
             if hasattr(config, "to_dict"):
                 payload["model_config"] = config.to_dict()
+        try:
+            parameter = next(model.parameters())
+            payload["effective_parameter_dtype"] = str(parameter.dtype)
+            payload["effective_parameter_device_type"] = parameter.device.type
+        except (AttributeError, StopIteration):
+            pass
     if tokenizer is not None:
         payload["tokenizer_class"] = type(tokenizer).__qualname__
         init_kwargs = getattr(tokenizer, "init_kwargs", {})

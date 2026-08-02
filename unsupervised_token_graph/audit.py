@@ -182,6 +182,22 @@ def _render_markdown(report: Mapping[str, object]) -> str:
     ]
     for name, count in report["pattern_counts"].items():
         lines.append(f"| `{name}` | {count} |")
+    evaluation_status = report.get("evaluation_status")
+    if evaluation_status and evaluation_status.get("state") == "single_class":
+        counts = evaluation_status["class_counts"]
+        lines.extend(
+            [
+                "",
+                "## Evaluation-only metrics unavailable",
+                "",
+                "AUROC is not defined because this pilot contains only one "
+                "evaluation class. Feature extraction and casebook artifacts "
+                "remain valid.",
+                "",
+                f"- Correct (label 0): {counts['0']}",
+                f"- Error (label 1): {counts['1']}",
+            ]
+        )
     if "feature_separation" in report:
         lines.extend(
             [
@@ -407,10 +423,31 @@ def run_pattern_audit(
     }
     if evaluation_labels_path:
         labels = read_evaluation_labels(evaluation_labels_path)
-        report["feature_separation"] = summarize_feature_separation(scored, labels)
-        report["pattern_enrichment"] = summarize_pattern_enrichment(scored, labels)
-        report["paired_feature_deltas"] = summarize_paired_feature_deltas(scored, labels)
-        report["paired_ranking"] = summarize_paired_ranking(scored, labels)
+        observed_labels = []
+        for record in scored:
+            example_id = str(record["example_id"])
+            if example_id not in labels:
+                raise ValueError(f"Missing evaluation label for {example_id!r}")
+            label = int(labels[example_id])
+            if label not in (0, 1):
+                raise ValueError("evaluation labels must be binary")
+            observed_labels.append(label)
+        class_counts = {
+            "0": observed_labels.count(0),
+            "1": observed_labels.count(1),
+        }
+        has_both_classes = all(class_counts.values())
+        report["evaluation_status"] = {
+            "state": "complete" if has_both_classes else "single_class",
+            "class_counts": class_counts,
+        }
+        if has_both_classes:
+            report["feature_separation"] = summarize_feature_separation(scored, labels)
+            report["pattern_enrichment"] = summarize_pattern_enrichment(scored, labels)
+            report["paired_feature_deltas"] = summarize_paired_feature_deltas(
+                scored, labels
+            )
+            report["paired_ranking"] = summarize_paired_ranking(scored, labels)
         if examples_path:
             cases = _evaluation_case_records(
                 scored, read_prepared_examples(examples_path), labels

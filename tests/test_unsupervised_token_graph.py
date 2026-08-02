@@ -159,6 +159,8 @@ class DatasetAdapterContractTests(unittest.TestCase):
                 return {
                     "input_ids": torch.tensor([[1, 2]]),
                     "attention_mask": torch.ones((1, 2), dtype=torch.long),
+                    "offset_mapping": torch.tensor([[[0, 0], [0, 1]]]),
+                    "special_tokens_mask": torch.tensor([[1, 0]]),
                 }
 
             def decode(self, tokens, **options):
@@ -187,6 +189,8 @@ class DatasetAdapterContractTests(unittest.TestCase):
             )
             generated_row = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(generated_row["replay_input_ids"], [1, 2, 3])
+            self.assertEqual(generated_row["replay_segment_ids"][-1], 3)
+            self.assertEqual(len(generated_row["replay_segment_ids"]), 3)
 
             with self.assertRaisesRegex(RuntimeError, "stale BoolQ prediction"):
                 generate_boolq_predictions(
@@ -198,6 +202,61 @@ class DatasetAdapterContractTests(unittest.TestCase):
                     max_input_tokens=16,
                     max_new_tokens=2,
                 )
+
+    def test_boolq_generation_quarantines_non_yes_no_outputs(self):
+        class FakeTokenizer:
+            eos_token_id = 0
+
+            def __init__(self):
+                self.decode_count = 0
+
+            def __call__(self, prompt, **options):
+                return {
+                    "input_ids": torch.tensor([[1, 2]]),
+                    "attention_mask": torch.ones((1, 2), dtype=torch.long),
+                    "offset_mapping": torch.tensor([[[0, 0], [0, 1]]]),
+                    "special_tokens_mask": torch.tensor([[1, 0]]),
+                }
+
+            def decode(self, tokens, **options):
+                self.decode_count += 1
+                return "Maybe" if self.decode_count == 1 else "No"
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+            def generate(self, input_ids, **options):
+                suffix = torch.tensor([[3]], device=input_ids.device)
+                return torch.cat((input_ids, suffix), dim=1)
+
+        records = [
+            {"id": "invalid", "passage": "P1", "question": "Q1?"},
+            {"id": "valid", "passage": "P2", "question": "Q2?"},
+        ]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "predictions.jsonl"
+            count = generate_boolq_predictions(
+                FakeModel(),
+                FakeTokenizer(),
+                records,
+                output_path=output,
+                model_id="model-a",
+                max_input_tokens=16,
+                max_new_tokens=2,
+            )
+            valid_rows = [json.loads(line) for line in output.read_text().splitlines()]
+            invalid_rows = [
+                json.loads(line)
+                for line in (output.parent / f"{output.name}.invalid.jsonl")
+                .read_text()
+                .splitlines()
+            ]
+
+        self.assertEqual(count, 1)
+        self.assertEqual([row["id"] for row in valid_rows], ["valid"])
+        self.assertEqual([row["id"] for row in invalid_rows], ["invalid"])
 
     def test_dataset_adapters_reject_ambiguous_ids_and_non_boolean_boolq_gold(self):
         duplicate_halueval = {

@@ -376,6 +376,54 @@ class PreparedDatasetTests(unittest.TestCase):
         self.assertTrue(all(record["answer"].startswith("Answer") for record in error_cases))
         self.assertIn("support-routing", markdown)
 
+    def test_single_class_boolq_pilot_keeps_audit_artifacts_without_auc(self):
+        examples = [
+            compose_example(
+                f"Passage {index}",
+                f"Question {index}?",
+                "Yes",
+                example_id=f"boolq-{index}",
+                dataset="boolq",
+            )
+            for index in range(4)
+        ]
+        labels = {example.example_id: 0 for example in examples}
+        features = [
+            {
+                "example_id": example.example_id,
+                "pair_id": example.pair_id,
+                "answer_to_passage_token_normalized": 0.2 + index * 0.1,
+                "answer_to_question_token_normalized": 0.6 - index * 0.1,
+            }
+            for index, example in enumerate(examples)
+        ]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            paths = write_prepared_dataset(examples, labels, root / "prepared")
+            features_path = root / "features.jsonl"
+            features_path.write_text(
+                "\n".join(json.dumps(record) for record in features) + "\n",
+                encoding="utf-8",
+            )
+
+            report = run_pattern_audit(
+                features_path,
+                root / "audit",
+                evaluation_labels_path=paths["evaluation_labels"],
+                examples_path=paths["examples"],
+            )
+
+            markdown = (root / "audit" / "pattern_audit.md").read_text(
+                encoding="utf-8"
+            )
+
+        self.assertEqual(report["evaluation_status"]["state"], "single_class")
+        self.assertEqual(
+            report["evaluation_status"]["class_counts"], {"0": 4, "1": 0}
+        )
+        self.assertNotIn("feature_separation", report)
+        self.assertIn("AUROC is not defined", markdown)
+
 
 if __name__ == "__main__":
     unittest.main()

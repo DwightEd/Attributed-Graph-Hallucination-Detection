@@ -9,23 +9,33 @@ from pathlib import Path
 
 import torch
 
-from .data import BOOLQ_ANSWER_HEADER, compose_example, read_json_records
+from .data import (
+    BOOLQ_ANSWER_HEADER,
+    compose_example,
+    parse_bool_answer,
+    read_json_records,
+)
 from .identity import model_source_signature
+from .trace import assign_segment_ids
 
 
-_PROMPT_VERSION = "boolq_yes_no_v2_exact_replay"
+_PROMPT_VERSION = "boolq_yes_no_v3_exact_token_replay"
 
 
-def build_boolq_generation_prompt(passage: str, question: str) -> str:
-    """Create the same passage/question context without a gold-answer field."""
-
+def _build_boolq_generation_example(passage: str, question: str):
     return compose_example(
         passage,
         question,
         "",
         example_id="generation-prompt",
         answer_header=BOOLQ_ANSWER_HEADER,
-    ).text
+    )
+
+
+def build_boolq_generation_prompt(passage: str, question: str) -> str:
+    """Create the same passage/question context without a gold-answer field."""
+
+    return _build_boolq_generation_example(passage, question).text
 
 
 def _generation_fingerprint(
@@ -36,7 +46,7 @@ def _generation_fingerprint(
     max_new_tokens: int,
 ) -> str:
     payload = {
-        "schema": "boolq_prediction_v1",
+        "schema": "boolq_prediction_v2",
         "prompt_version": _PROMPT_VERSION,
         "prompt": build_boolq_generation_prompt(
             str(record["passage"]), str(record["question"])
@@ -86,6 +96,7 @@ def generate_boolq_predictions(
         }
     checkpoint_directory = output.parent / f"{output.name}.parts"
     checkpoint_directory.mkdir(parents=True, exist_ok=True)
+    invalid_predictions = []
     for checkpoint in checkpoint_directory.glob("*.json"):
         row = json.loads(checkpoint.read_text(encoding="utf-8"))
         existing[str(row["id"])] = row
@@ -113,14 +124,17 @@ def generate_boolq_predictions(
                 )
             selected[example_id] = resumed
             continue
-        prompt = build_boolq_generation_prompt(
+        prompt_example = _build_boolq_generation_example(
             str(record["passage"]), str(record["question"])
         )
+        prompt = prompt_example.text
         encoded = tokenizer(
             prompt,
             return_tensors="pt",
             truncation=False,
             add_special_tokens=True,
+            return_offsets_mapping=True,
+            return_special_tokens_mask=True,
         )
         input_ids = encoded["input_ids"].to(device)
         if max_input_tokens is not None and input_ids.shape[1] > max_input_tokens:
@@ -146,7 +160,44 @@ def generate_boolq_predictions(
             answer_tokens = answer_tokens[:-1]
         model_answer = tokenizer.decode(answer_tokens, skip_special_tokens=True)
         if not model_answer.strip():
-            raise ValueError(f"BoolQ generation for {example_id!r} produced no answer text")
+            invalid_predictions.append(
+                {
+                    "id": example_id,
+                    "model_answer": model_answer,
+                    "model_id": model_id,
+                    "generation_fingerprint": fingerprint,
+                    "reason": "empty_generation",
+                }
+            )
+            print(f"Skipping BoolQ {example_id!r}: empty generation", flush=True)
+            continue
+        try:
+            parse_bool_answer(model_answer)
+        except ValueError as error:
+            invalid_predictions.append(
+                {
+                    "id": example_id,
+                    "model_answer": model_answer,
+                    "model_id": model_id,
+                    "generation_fingerprint": fingerprint,
+                    "reason": str(error),
+                }
+            )
+            print(f"Skipping BoolQ {example_id!r}: {error}", flush=True)
+            continue
+        prompt_offsets = torch.as_tensor(encoded["offset_mapping"])[0].tolist()
+        prompt_special = (
+            torch.as_tensor(encoded["special_tokens_mask"])[0].bool().tolist()
+        )
+        prompt_segment_ids = assign_segment_ids(
+            prompt_offsets,
+            prompt_example.segment_char_spans,
+            prompt_special,
+        )
+        prompt_attention_mask = encoded.get("attention_mask")
+        if prompt_attention_mask is None:
+            prompt_attention_mask = torch.ones_like(encoded["input_ids"])
+        answer_length = int(len(answer_tokens))
         prediction = {
             "id": example_id,
             "model_answer": model_answer,
@@ -154,6 +205,14 @@ def generate_boolq_predictions(
             "generation_fingerprint": fingerprint,
             "replay_input_ids": input_ids[0].detach().cpu().tolist()
             + answer_tokens.tolist(),
+            "replay_attention_mask": (
+                torch.as_tensor(prompt_attention_mask)[0].detach().cpu().tolist()
+                + [1] * answer_length
+            ),
+            "replay_offset_mapping": prompt_offsets
+            + [[len(prompt), len(prompt)]] * answer_length,
+            "replay_special_tokens_mask": prompt_special + [False] * answer_length,
+            "replay_segment_ids": prompt_segment_ids + [3] * answer_length,
         }
         selected[example_id] = prediction
         _atomic_json_write(
@@ -172,6 +231,17 @@ def generate_boolq_predictions(
         encoding="utf-8",
     )
     temporary_output.replace(output)
+    invalid_output = output.parent / f"{output.name}.invalid.jsonl"
+    temporary_invalid_output = invalid_output.with_suffix(invalid_output.suffix + ".tmp")
+    temporary_invalid_output.write_text(
+        "\n".join(
+            json.dumps(row, ensure_ascii=False, sort_keys=True)
+            for row in invalid_predictions
+        )
+        + ("\n" if invalid_predictions else ""),
+        encoding="utf-8",
+    )
+    temporary_invalid_output.replace(invalid_output)
     return len(selected)
 
 

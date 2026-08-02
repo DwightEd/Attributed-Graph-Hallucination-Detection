@@ -42,7 +42,63 @@ def tokenize_example_once(
     *,
     max_tokens: int | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Tokenize the final passage/question/answer text exactly once."""
+    """Tokenize once, or replay the exact token sequence produced for BoolQ."""
+
+    replay_input_ids = example.metadata.get("replay_input_ids")
+    if replay_input_ids is not None:
+        required = (
+            "replay_attention_mask",
+            "replay_offset_mapping",
+            "replay_special_tokens_mask",
+            "replay_segment_ids",
+        )
+        missing = [name for name in required if name not in example.metadata]
+        if missing:
+            raise ValueError(
+                f"BoolQ example {example.example_id!r} has incomplete exact replay "
+                f"metadata: {missing}"
+            )
+        input_ids = torch.as_tensor(replay_input_ids, dtype=torch.long)
+        attention_mask = torch.as_tensor(
+            example.metadata["replay_attention_mask"], dtype=torch.long
+        )
+        offsets = torch.as_tensor(
+            example.metadata["replay_offset_mapping"], dtype=torch.long
+        )
+        special = torch.as_tensor(
+            example.metadata["replay_special_tokens_mask"], dtype=torch.bool
+        )
+        segment_ids = torch.as_tensor(
+            example.metadata["replay_segment_ids"], dtype=torch.long
+        )
+        token_count = len(input_ids)
+        if any(
+            len(value) != token_count
+            for value in (attention_mask, offsets, special, segment_ids)
+        ):
+            raise ValueError(
+                f"BoolQ exact replay arrays differ in length for {example.example_id!r}"
+            )
+        if offsets.ndim != 2 or offsets.shape[1] != 2:
+            raise ValueError(
+                f"BoolQ exact replay offsets are malformed for {example.example_id!r}"
+            )
+        if max_tokens is not None and token_count > max_tokens:
+            raise ValueError(
+                f"example {example.example_id!r} has {token_count} tokens and "
+                f"exceeds max_tokens={max_tokens}; full-context extraction refuses truncation"
+            )
+        answer_mask = segment_ids == 3
+        if not bool(answer_mask.any()):
+            raise ValueError(f"answer segment for {example.example_id!r} has no tokens")
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "offset_mapping": offsets,
+            "special_tokens_mask": special,
+            "segment_ids": segment_ids,
+            "answer_mask": answer_mask,
+        }
 
     encoded = tokenizer(
         example.text,
@@ -54,12 +110,6 @@ def tokenize_example_once(
         truncation=False,
     )
     input_ids = torch.as_tensor(_unbatch(encoded["input_ids"]), dtype=torch.long)
-    replay_input_ids = example.metadata.get("replay_input_ids")
-    if replay_input_ids is not None and input_ids.tolist() != list(replay_input_ids):
-        raise ValueError(
-            f"BoolQ example {example.example_id!r} does not retokenize to the exact "
-            "generation ids; refusing an inexact attention replay"
-        )
     if max_tokens is not None and len(input_ids) > max_tokens:
         raise ValueError(
             f"example {example.example_id!r} has {len(input_ids)} tokens and "
@@ -271,10 +321,11 @@ def _fingerprint(
     *,
     max_tokens: int | None = None,
     model_signature: str | None = None,
+    extraction_dtype: str = "unknown",
 ) -> str:
     payload = json.dumps(
         {
-            "schema": "token_trace_graph_v2",
+            "schema": "token_trace_graph_v3",
             "text": example.text,
             "model_id": model_id,
             "model_signature": model_signature or model_id,
@@ -283,6 +334,18 @@ def _fingerprint(
             "include_prefix_edges": include_prefix_edges,
             "include_hidden_nodes": include_hidden_nodes,
             "max_tokens": max_tokens,
+            "extraction_dtype": extraction_dtype,
+            "exact_replay": {
+                name: example.metadata.get(name)
+                for name in (
+                    "replay_input_ids",
+                    "replay_attention_mask",
+                    "replay_offset_mapping",
+                    "replay_special_tokens_mask",
+                    "replay_segment_ids",
+                )
+                if name in example.metadata
+            },
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -318,6 +381,7 @@ def extract_prepared_dataset(
     overwrite: bool = False,
     model_signature: str | None = None,
     max_attention_bytes: int | None = None,
+    extraction_dtype: str = "unknown",
 ) -> dict[str, object]:
     """Extract traces, token graphs, and scalar pattern features without labels."""
 
@@ -339,6 +403,7 @@ def extract_prepared_dataset(
             include_hidden_nodes,
             max_tokens=max_tokens,
             model_signature=model_signature,
+            extraction_dtype=extraction_dtype,
         )
         if trace_path.exists() and graph_path.exists() and not overwrite:
             trace = torch.load(trace_path, map_location="cpu", weights_only=True)
@@ -385,6 +450,7 @@ def extract_prepared_dataset(
             )
             trace["extractor_model_id"] = model_id
             trace["extraction_fingerprint"] = fingerprint
+            trace["extraction_dtype"] = extraction_dtype
             trace["edge_threshold"] = float(tau)
             graph = build_token_graph(
                 trace["input_ids"],
@@ -411,6 +477,10 @@ def extract_prepared_dataset(
             stored_trace["hidden_states"] = trace["hidden_states"].half()
             _atomic_torch_save(stored_trace, trace_path)
             _atomic_torch_save(graph, graph_path)
+            # Summaries must use the exact persisted representation. Otherwise a
+            # resumed run would summarize float16 cache values while the first
+            # run summarized transient float32 tensors.
+            trace = stored_trace
         feature_records.append(summarize_trace_record(trace))
         if position == 1 or position % 25 == 0 or position == len(examples):
             print(f"Extracted {position}/{len(examples)} token graphs")
@@ -435,6 +505,7 @@ def extract_prepared_dataset(
         "include_prefix_edges": include_prefix_edges,
         "include_hidden_nodes": include_hidden_nodes,
         "max_attention_bytes": max_attention_bytes,
+        "extraction_dtype": extraction_dtype,
         "trace_dir": str(trace_directory),
         "graph_dir": str(graph_directory),
         "graph_files": [
@@ -510,6 +581,7 @@ def main(argv: list[str] | None = None) -> int:
         overwrite=args.overwrite,
         model_signature=source_signature,
         max_attention_bytes=int(args.max_attention_gib * 1024**3),
+        extraction_dtype=args.dtype,
     )
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
     return 0

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}"
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
 DATASET="${DATASET:-halueval_qa}"
 SOURCE_DATA="${SOURCE_DATA:?Set SOURCE_DATA to HaluEval qa_data.json or BoolQ JSONL}"
@@ -10,6 +12,8 @@ PILOT_LIMIT="${PILOT_LIMIT:-300}"
 MAX_TOKENS="${MAX_TOKENS:-1024}"
 MAX_ATTENTION_GIB="${MAX_ATTENTION_GIB:-12}"
 RUN_TRAINING="${RUN_TRAINING:-0}"
+DEVICE="${DEVICE:-cuda:0}"
+DTYPE="${DTYPE:-float16}"
 
 PREPARED_DIR="${RUN_DIR}/prepared"
 EXTRACTION_DIR="${RUN_DIR}/extraction"
@@ -30,7 +34,9 @@ elif [[ "${DATASET}" == "boolq" ]]; then
     --model "${MODEL_PATH}" \
     --output "${BOOLQ_PREDICTIONS}" \
     --limit "${PILOT_LIMIT}" \
-    --max-input-tokens "${MAX_TOKENS}"
+    --max-input-tokens "${MAX_TOKENS}" \
+    --device "${DEVICE}" \
+    --dtype "${DTYPE}"
   "${PYTHON_BIN}" -m unsupervised_token_graph.prepare \
     --dataset boolq \
     --input "${SOURCE_DATA}" \
@@ -48,7 +54,9 @@ fi
   --output-dir "${EXTRACTION_DIR}" \
   --max-tokens "${MAX_TOKENS}" \
   --max-attention-gib "${MAX_ATTENTION_GIB}" \
-  --limit "${PILOT_LIMIT}"
+  --limit "${PILOT_LIMIT}" \
+  --device "${DEVICE}" \
+  --dtype "${DTYPE}"
 
 "${PYTHON_BIN}" -m unsupervised_token_graph.audit \
   --features "${EXTRACTION_DIR}/features.jsonl" \

@@ -182,15 +182,76 @@ def load_boolq_predictions(
             )
         gold_bool = row["answer"]
         metadata = {"title": str(row.get("title", ""))}
-        if "replay_input_ids" in predictions[example_id]:
-            replay_ids = predictions[example_id]["replay_input_ids"]
-            if not isinstance(replay_ids, list) or not all(
+        replay_fields = (
+            "replay_input_ids",
+            "replay_attention_mask",
+            "replay_offset_mapping",
+            "replay_special_tokens_mask",
+            "replay_segment_ids",
+        )
+        present_replay_fields = {
+            name for name in replay_fields if name in predictions[example_id]
+        }
+        if present_replay_fields and present_replay_fields != set(replay_fields):
+            missing = sorted(set(replay_fields) - present_replay_fields)
+            raise ValueError(
+                f"BoolQ exact replay for {example_id!r} is incomplete; missing {missing}"
+            )
+        if present_replay_fields:
+            replay = {name: predictions[example_id][name] for name in replay_fields}
+            replay_ids = replay["replay_input_ids"]
+            if not isinstance(replay_ids, list) or not replay_ids or not all(
                 isinstance(token_id, int) for token_id in replay_ids
             ):
                 raise ValueError(
                     f"BoolQ replay_input_ids for {example_id!r} must be integer ids"
                 )
-            metadata["replay_input_ids"] = replay_ids
+            sequence_length = len(replay_ids)
+            replay_mask = replay["replay_attention_mask"]
+            replay_special = replay["replay_special_tokens_mask"]
+            replay_segments = replay["replay_segment_ids"]
+            replay_offsets = replay["replay_offset_mapping"]
+            if (
+                not isinstance(replay_mask, list)
+                or len(replay_mask) != sequence_length
+                or any(value not in (0, 1, False, True) for value in replay_mask)
+            ):
+                raise ValueError(f"BoolQ replay mask length differs for {example_id!r}")
+            if (
+                not isinstance(replay_special, list)
+                or len(replay_special) != sequence_length
+                or any(value not in (0, 1, False, True) for value in replay_special)
+            ):
+                raise ValueError(
+                    f"BoolQ replay special-mask is invalid for {example_id!r}"
+                )
+            if (
+                not isinstance(replay_segments, list)
+                or len(replay_segments) != sequence_length
+                or any(segment not in (0, 1, 2, 3) for segment in replay_segments)
+                or 3 not in replay_segments
+            ):
+                raise ValueError(f"BoolQ replay segment ids are invalid for {example_id!r}")
+            answer_start = replay_segments.index(3)
+            if not {1, 2}.issubset(replay_segments[:answer_start]) or any(
+                segment != 3 for segment in replay_segments[answer_start:]
+            ):
+                raise ValueError(
+                    f"BoolQ replay must contain passage/question and a contiguous "
+                    f"answer suffix for {example_id!r}"
+                )
+            if (
+                not isinstance(replay_offsets, list)
+                or len(replay_offsets) != sequence_length
+                or any(
+                    not isinstance(offset, (list, tuple))
+                    or len(offset) != 2
+                    or not all(isinstance(value, int) for value in offset)
+                    for offset in replay_offsets
+                )
+            ):
+                raise ValueError(f"BoolQ replay offsets are invalid for {example_id!r}")
+            metadata.update(replay)
         examples.append(
             compose_example(
                 str(row["passage"]),

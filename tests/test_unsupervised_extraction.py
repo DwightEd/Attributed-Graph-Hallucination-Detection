@@ -82,6 +82,37 @@ class SingleTokenizationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exceeds max_tokens"):
             tokenize_example_once(tokenizer, example, max_tokens=3)
 
+    def test_boolq_exact_generation_tokens_are_replayed_without_retokenizing(self):
+        class MustNotRetokenize:
+            call_count = 0
+
+            def __call__(self, *args, **kwargs):
+                self.call_count += 1
+                raise AssertionError("exact generation replay must bypass tokenization")
+
+        tokenizer = MustNotRetokenize()
+        example = compose_example(
+            "P",
+            "Q",
+            "Yes",
+            example_id="boolq-sample",
+            dataset="boolq",
+            metadata={
+                "replay_input_ids": [1, 11, 22, 33],
+                "replay_attention_mask": [1, 1, 1, 1],
+                "replay_offset_mapping": [[0, 0], [9, 10], [23, 24], [42, 42]],
+                "replay_special_tokens_mask": [1, 0, 0, 0],
+                "replay_segment_ids": [0, 1, 2, 3],
+            },
+        )
+
+        encoded = tokenize_example_once(tokenizer, example, max_tokens=8)
+
+        self.assertEqual(tokenizer.call_count, 0)
+        self.assertEqual(encoded["input_ids"].tolist(), [1, 11, 22, 33])
+        self.assertEqual(encoded["segment_ids"].tolist(), [0, 1, 2, 3])
+        self.assertEqual(encoded["answer_mask"].tolist(), [False, False, False, True])
+
     def test_cache_fingerprint_changes_when_graph_edge_policy_changes(self):
         example = compose_example("P", "Q", "A", example_id="sample")
 
@@ -123,6 +154,51 @@ class SingleTokenizationTests(unittest.TestCase):
             max_tokens=256,
         )
         self.assertNotEqual(lower_limit, higher_limit)
+
+    def test_cache_fingerprint_changes_when_extraction_dtype_changes(self):
+        example = compose_example("P", "Q", "A", example_id="sample")
+
+        float16 = _fingerprint(
+            example,
+            "model-a",
+            (1,),
+            0.05,
+            True,
+            False,
+            extraction_dtype="float16",
+        )
+        bfloat16 = _fingerprint(
+            example,
+            "model-a",
+            (1,),
+            0.05,
+            True,
+            False,
+            extraction_dtype="bfloat16",
+        )
+
+        self.assertNotEqual(float16, bfloat16)
+
+    def test_cache_fingerprint_includes_exact_generation_replay(self):
+        first = compose_example(
+            "P",
+            "Q",
+            "Yes",
+            example_id="sample",
+            metadata={"replay_input_ids": [1, 2, 3], "replay_segment_ids": [1, 2, 3]},
+        )
+        second = compose_example(
+            "P",
+            "Q",
+            "Yes",
+            example_id="sample",
+            metadata={"replay_input_ids": [1, 2, 4], "replay_segment_ids": [1, 2, 3]},
+        )
+
+        first_fingerprint = _fingerprint(first, "model-a", (1,), 0.05, True, False)
+        second_fingerprint = _fingerprint(second, "model-a", (1,), 0.05, True, False)
+
+        self.assertNotEqual(first_fingerprint, second_fingerprint)
 
     def test_external_example_ids_cannot_escape_the_artifact_directory(self):
         artifact_directory = Path("safe-artifacts")
@@ -222,6 +298,32 @@ class TraceSummaryTests(unittest.TestCase):
 
 
 class ExtractionCacheIntegrityTests(unittest.TestCase):
+    def test_first_pass_and_resumed_pass_write_identical_scalar_features(self):
+        example = compose_example("P", "Q", "A", example_id="sample")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "extraction"
+            options = {
+                "output_dir": output,
+                "model_id": "fake-model",
+                "selected_hidden_layers": (1,),
+                "max_tokens": 8,
+                "tau": 0.05,
+                "include_prefix_edges": True,
+                "include_hidden_nodes": False,
+                "extraction_dtype": "float16",
+            }
+            extract_prepared_dataset(
+                _FakeModel(), _FakeTokenizer(example), [example], **options
+            )
+            first_features = (output / "features.jsonl").read_bytes()
+
+            extract_prepared_dataset(
+                _FakeModel(), _FakeTokenizer(example), [example], **options
+            )
+            resumed_features = (output / "features.jsonl").read_bytes()
+
+        self.assertEqual(first_features, resumed_features)
+
     def test_cached_trace_and_graph_fingerprints_must_both_match(self):
         example = compose_example("P", "Q", "A", example_id="sample")
         with tempfile.TemporaryDirectory() as temporary_directory:
