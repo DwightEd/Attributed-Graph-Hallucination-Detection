@@ -82,12 +82,14 @@ def summarize_attention_trace(
         active_slots += int(edge_presence[query, :query].sum())
 
     passage_ratio = masses["passage"] / safe_covered_mass
+    question_ratio = masses["question"] / safe_covered_mass
     answer_ratio = masses["answer"] / safe_covered_mass
     return {
         "answer_to_passage_mass": masses["passage"],
         "answer_to_question_mass": masses["question"],
         "answer_to_answer_mass": masses["answer"],
         "answer_to_passage_ratio": passage_ratio,
+        "answer_to_question_ratio": question_ratio,
         "answer_self_reliance": answer_ratio,
         "answer_attention_entropy": entropy.mean(axis=-1),
         "passage_head_disagreement": float(passage_ratio.std(axis=1).mean()),
