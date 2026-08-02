@@ -38,6 +38,7 @@ def masked_reconstruction_loss(
     masked_nodes: torch.Tensor,
     *,
     trim_fraction: float = 0.0,
+    graph_ptr: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """MSE over masked nodes, optionally trimming the largest node residuals."""
 
@@ -48,11 +49,34 @@ def masked_reconstruction_loss(
         raise ValueError("masked_nodes must select at least one node")
     if not 0.0 <= trim_fraction < 1.0:
         raise ValueError("trim_fraction must be in [0, 1)")
-    per_node = (predictions[mask] - targets[mask]).square().mean(dim=-1)
-    if trim_fraction:
-        keep = max(1, int(len(per_node) * (1.0 - trim_fraction)))
-        per_node = torch.topk(per_node, keep, largest=False).values
-    return per_node.mean()
+    residuals = (predictions - targets).square().mean(dim=-1)
+
+    def reduce_selected(residual_values, selected):
+        per_node = residual_values[selected]
+        if not len(per_node):
+            raise ValueError("every graph must contain a masked answer node")
+        if trim_fraction:
+            keep = max(1, int(len(per_node) * (1.0 - trim_fraction)))
+            per_node = torch.topk(per_node, keep, largest=False).values
+        return per_node.mean()
+
+    if graph_ptr is None:
+        return reduce_selected(residuals, mask)
+    pointers = torch.as_tensor(graph_ptr, dtype=torch.long, device=predictions.device)
+    if (
+        pointers.ndim != 1
+        or len(pointers) < 2
+        or int(pointers[0]) != 0
+        or int(pointers[-1]) != len(predictions)
+        or bool((pointers[1:] <= pointers[:-1]).any())
+    ):
+        raise ValueError("graph_ptr must be strictly increasing from zero to node count")
+    pointer_values = pointers.tolist()
+    graph_losses = [
+        reduce_selected(residuals[start:end], mask[start:end])
+        for start, end in zip(pointer_values[:-1], pointer_values[1:])
+    ]
+    return torch.stack(graph_losses).mean()
 
 
 def _make_mlp(input_dim: int, hidden_dim: int, output_dim: int, dropout: float):
@@ -62,6 +86,19 @@ def _make_mlp(input_dim: int, hidden_dim: int, output_dim: int, dropout: float):
         nn.Dropout(dropout),
         nn.Linear(hidden_dim, output_dim),
     )
+
+
+def _mask_incident_edge_attributes(
+    edge_index: torch.Tensor,
+    edge_attr: torch.Tensor,
+    masked_nodes: torch.Tensor,
+) -> torch.Tensor:
+    """Hide attention values on edges touching a masked answer token."""
+
+    mask = torch.as_tensor(masked_nodes, dtype=torch.bool, device=edge_index.device)
+    source, target = edge_index
+    incident = mask[source] | mask[target]
+    return torch.where(incident.unsqueeze(1), torch.zeros_like(edge_attr), edge_attr)
 
 
 class CharmMeanMessagePassing(nn.Module):
@@ -119,11 +156,13 @@ class TokenGraphMaskedAutoencoder(nn.Module):
         hidden_dim: int,
         num_layers: int,
         dropout: float,
+        mask_incident_edge_attrs: bool = True,
     ):
         super().__init__()
         if num_layers < 1:
             raise ValueError("num_layers must be positive")
         self.mask_token = nn.Parameter(torch.zeros(node_dim))
+        self.mask_incident_edge_attrs = bool(mask_incident_edge_attrs)
         self.input_projection = nn.Linear(node_dim, hidden_dim)
         self.message_layers = nn.ModuleList(
             CharmMeanMessagePassing(
@@ -146,6 +185,10 @@ class TokenGraphMaskedAutoencoder(nn.Module):
     ):
         mask = torch.as_tensor(masked_nodes, dtype=torch.bool, device=x.device)
         masked_x = torch.where(mask.unsqueeze(1), self.mask_token, x)
+        if self.mask_incident_edge_attrs:
+            edge_attr = _mask_incident_edge_attributes(
+                edge_index, edge_attr, mask
+            )
         hidden = F.relu(self.input_projection(masked_x))
         for layer in self.message_layers:
             hidden = F.relu(layer(hidden, edge_index, edge_attr, edge_mark))

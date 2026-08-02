@@ -1,15 +1,22 @@
 import unittest
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 
 from unsupervised_token_graph.data import compose_example
 from unsupervised_token_graph.extract import (
+    _artifact_path,
+    _estimate_attention_storage_bytes,
+    _fingerprint,
     compute_teacher_forced_statistics,
     extract_example_trace,
+    extract_prepared_dataset,
     summarize_trace_record,
     tokenize_example_once,
 )
+from unsupervised_token_graph.identity import model_source_signature
 
 
 class _FakeTokenizer:
@@ -75,6 +82,73 @@ class SingleTokenizationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exceeds max_tokens"):
             tokenize_example_once(tokenizer, example, max_tokens=3)
 
+    def test_cache_fingerprint_changes_when_graph_edge_policy_changes(self):
+        example = compose_example("P", "Q", "A", example_id="sample")
+
+        with_prefix_edges = _fingerprint(
+            example,
+            "model-a",
+            (1,),
+            0.05,
+            True,
+            False,
+        )
+        without_prefix_edges = _fingerprint(
+            example,
+            "model-a",
+            (1,),
+            0.05,
+            False,
+            False,
+        )
+
+        self.assertNotEqual(with_prefix_edges, without_prefix_edges)
+
+        lower_limit = _fingerprint(
+            example,
+            "model-a",
+            (1,),
+            0.05,
+            True,
+            False,
+            max_tokens=128,
+        )
+        higher_limit = _fingerprint(
+            example,
+            "model-a",
+            (1,),
+            0.05,
+            True,
+            False,
+            max_tokens=256,
+        )
+        self.assertNotEqual(lower_limit, higher_limit)
+
+    def test_external_example_ids_cannot_escape_the_artifact_directory(self):
+        artifact_directory = Path("safe-artifacts")
+        artifact = _artifact_path(artifact_directory, "../../outside")
+
+        self.assertEqual(artifact.parent, artifact_directory)
+        self.assertNotIn("..", artifact.name)
+        self.assertEqual(artifact.suffix, ".pt")
+
+    def test_local_model_signature_changes_when_checkpoint_files_change(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            model_directory = Path(temporary_directory) / "model"
+            model_directory.mkdir()
+            checkpoint = model_directory / "model.safetensors"
+            checkpoint.write_bytes(b"first")
+            first = model_source_signature(model_directory)
+            checkpoint.write_bytes(b"second-version")
+            second = model_source_signature(model_directory)
+
+        self.assertNotEqual(first, second)
+
+    def test_attention_storage_estimate_exposes_4096_token_cost(self):
+        estimated = _estimate_attention_storage_bytes(32, 32, 4096)
+
+        self.assertEqual(estimated, 64 * 1024**3)
+
 
 class TeacherForcedStatisticsTests(unittest.TestCase):
     def test_log_probability_and_entropy_are_aligned_to_the_predicted_token(self):
@@ -131,15 +205,48 @@ class TraceSummaryTests(unittest.TestCase):
             "segment_ids": torch.tensor([0, 1, 2, 3]),
             "token_log_prob": torch.tensor([0.0, -1.0, -1.0, -0.1]),
             "token_stat_valid": torch.tensor([False, True, True, True]),
+            "edge_threshold": 0.03,
         }
+        attention[0, 0, 3, 0] = 0.04
 
         record = summarize_trace_record(trace)
 
         self.assertEqual(record["example_id"], "sample")
-        self.assertAlmostEqual(record["answer_to_passage_ratio"], 0.6)
-        self.assertAlmostEqual(record["answer_to_question_ratio"], 0.2)
-        self.assertAlmostEqual(record["answer_self_reliance"], 0.2)
+        self.assertAlmostEqual(record["answer_to_passage_mass"], 0.6)
+        self.assertAlmostEqual(record["answer_to_question_mass"], 0.2)
+        self.assertAlmostEqual(record["answer_to_passage_ratio"], 0.75)
+        self.assertAlmostEqual(record["answer_to_question_ratio"], 0.25)
+        self.assertAlmostEqual(record["answer_self_reliance"], 0.0)
         self.assertAlmostEqual(record["mean_answer_log_prob"], -0.1)
+        self.assertGreater(record["answer_edge_density"], 0.0)
+
+
+class ExtractionCacheIntegrityTests(unittest.TestCase):
+    def test_cached_trace_and_graph_fingerprints_must_both_match(self):
+        example = compose_example("P", "Q", "A", example_id="sample")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "extraction"
+            options = {
+                "output_dir": output,
+                "model_id": "fake-model",
+                "selected_hidden_layers": (1,),
+                "max_tokens": 8,
+                "tau": 0.05,
+                "include_prefix_edges": True,
+                "include_hidden_nodes": False,
+            }
+            extract_prepared_dataset(
+                _FakeModel(), _FakeTokenizer(example), [example], **options
+            )
+            graph_path = next((output / "graphs").glob("*.pt"))
+            graph = torch.load(graph_path, map_location="cpu", weights_only=False)
+            graph["extraction_fingerprint"] = "corrupted"
+            torch.save(graph, graph_path)
+
+            with self.assertRaisesRegex(RuntimeError, "graph cache"):
+                extract_prepared_dataset(
+                    _FakeModel(), _FakeTokenizer(example), [example], **options
+                )
 
 
 if __name__ == "__main__":

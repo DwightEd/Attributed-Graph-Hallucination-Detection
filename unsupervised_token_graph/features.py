@@ -53,16 +53,22 @@ def summarize_attention_trace(
     _validate_token_spans(segment_token_spans, values.shape[-1])
     answer_start, answer_end = segment_token_spans["answer"]
     answer_rows = values[:, :, answer_start:answer_end, :]
+    query_positions = np.arange(answer_start, answer_end).reshape(1, 1, -1, 1)
+    key_positions = np.arange(values.shape[-1]).reshape(1, 1, 1, -1)
+    causal_answer_rows = np.where(key_positions < query_positions, answer_rows, 0.0)
 
     masses: dict[str, np.ndarray] = {}
-    for name in SEGMENT_NAMES:
+    for name in ("passage", "question"):
         start, end = segment_token_spans[name]
-        masses[name] = answer_rows[..., start:end].sum(axis=-1).mean(axis=-1)
+        masses[name] = causal_answer_rows[..., start:end].sum(axis=-1).mean(axis=-1)
+    masses["answer"] = causal_answer_rows[
+        ..., answer_start:answer_end
+    ].sum(axis=-1).mean(axis=-1)
 
     covered_mass = sum(masses.values())
     safe_covered_mass = np.where(covered_mass > 0, covered_mass, 1.0)
-    normalized_rows = answer_rows / np.clip(
-        answer_rows.sum(axis=-1, keepdims=True), 1e-12, None
+    normalized_rows = causal_answer_rows / np.clip(
+        causal_answer_rows.sum(axis=-1, keepdims=True), 1e-12, None
     )
     entropy = -np.sum(
         np.where(
@@ -84,13 +90,35 @@ def summarize_attention_trace(
     passage_ratio = masses["passage"] / safe_covered_mass
     question_ratio = masses["question"] / safe_covered_mass
     answer_ratio = masses["answer"] / safe_covered_mass
+    passage_length = segment_token_spans["passage"][1] - segment_token_spans["passage"][0]
+    question_length = segment_token_spans["question"][1] - segment_token_spans["question"][0]
+    answer_length = answer_end - answer_start
+    mean_prior_slots = max((answer_length - 1) / 2.0, 1.0)
+    token_densities = {
+        "passage": masses["passage"] / passage_length,
+        "question": masses["question"] / question_length,
+        "answer": masses["answer"] / mean_prior_slots,
+    }
+    density_total = sum(token_densities.values())
+    safe_density_total = np.where(density_total > 0, density_total, 1.0)
     return {
         "answer_to_passage_mass": masses["passage"],
         "answer_to_question_mass": masses["question"],
         "answer_to_answer_mass": masses["answer"],
+        "answer_to_prior_answer_mass": masses["answer"],
         "answer_to_passage_ratio": passage_ratio,
         "answer_to_question_ratio": question_ratio,
         "answer_self_reliance": answer_ratio,
+        "answer_prior_reliance": answer_ratio,
+        "answer_to_passage_token_normalized": (
+            token_densities["passage"] / safe_density_total
+        ),
+        "answer_to_question_token_normalized": (
+            token_densities["question"] / safe_density_total
+        ),
+        "answer_to_prior_answer_token_normalized": (
+            token_densities["answer"] / safe_density_total
+        ),
         "answer_attention_entropy": entropy.mean(axis=-1),
         "passage_head_disagreement": float(passage_ratio.std(axis=1).mean()),
         "passage_layer_drift": float(

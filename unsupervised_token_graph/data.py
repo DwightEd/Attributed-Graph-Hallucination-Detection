@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
+BOOLQ_ANSWER_HEADER = "Answer only Yes or No"
+
+
 @dataclass(frozen=True)
 class TokenGraphExample:
     """One label-free passage/question/answer sequence."""
@@ -40,6 +43,7 @@ def compose_example(
     pair_id: str | None = None,
     dataset: str = "unknown",
     metadata: Mapping[str, Any] | None = None,
+    answer_header: str = "Answer",
 ) -> TokenGraphExample:
     """Concatenate all three segments and retain exact content boundaries."""
 
@@ -53,7 +57,8 @@ def compose_example(
     for index, (name, value) in enumerate(values.items()):
         if index:
             parts.append("\n\n")
-        parts.append(f"{name.title()}:\n")
+        header = answer_header if name == "answer" else name.title()
+        parts.append(f"{header}:\n")
         start = sum(len(part) for part in parts)
         parts.append(value)
         spans[name] = (start, start + len(value))
@@ -83,6 +88,12 @@ def _read_records(path: str | Path) -> list[dict[str, Any]]:
     return [dict(json.loads(line)) for line in text.splitlines() if line.strip()]
 
 
+def read_json_records(path: str | Path) -> list[dict[str, Any]]:
+    """Read either a JSON array or JSON Lines file."""
+
+    return _read_records(path)
+
+
 def load_halueval_qa(
     path: str | Path,
 ) -> tuple[list[TokenGraphExample], dict[str, int]]:
@@ -93,6 +104,10 @@ def load_halueval_qa(
     for row_index, row in enumerate(_read_records(path)):
         passage = str(row["knowledge"])
         question = str(row["question"])
+        if str(row["right_answer"]) == str(row["hallucinated_answer"]):
+            raise ValueError(
+                f"HaluEval row {row_index} has identical candidates and cannot form a pair"
+            )
         pair_id = f"halueval-{_stable_id(str(row_index), passage, question)}"
         candidates = (
             (str(row["right_answer"]), 0),
@@ -135,23 +150,47 @@ def _record_id(record: Mapping[str, Any], index: int) -> str:
 def load_boolq_predictions(
     dataset_path: str | Path,
     predictions_path: str | Path,
+    *,
+    allow_missing: bool = False,
 ) -> tuple[list[TokenGraphExample], dict[str, int]]:
     """Join generated BoolQ answers and derive correctness only for evaluation."""
 
     dataset_rows = _read_records(dataset_path)
-    predictions = {
-        _record_id(row, index): row
-        for index, row in enumerate(_read_records(predictions_path))
-    }
+    predictions = {}
+    for index, row in enumerate(_read_records(predictions_path)):
+        prediction_id = _record_id(row, index)
+        if prediction_id in predictions:
+            raise ValueError(f"Duplicate BoolQ prediction id {prediction_id!r}")
+        predictions[prediction_id] = row
     examples: list[TokenGraphExample] = []
     evaluation_labels: dict[str, int] = {}
+    seen_dataset_ids = set()
     for index, row in enumerate(dataset_rows):
         example_id = _record_id(row, index)
+        if example_id in seen_dataset_ids:
+            raise ValueError(f"Duplicate BoolQ dataset id {example_id!r}")
+        seen_dataset_ids.add(example_id)
         if example_id not in predictions:
+            if allow_missing:
+                continue
             raise ValueError(f"Missing BoolQ prediction for {example_id!r}")
         model_answer = str(predictions[example_id]["model_answer"])
         predicted_bool = parse_bool_answer(model_answer)
-        gold_bool = bool(row["answer"])
+        if not isinstance(row.get("answer"), bool):
+            raise ValueError(
+                f"BoolQ gold answer for {example_id!r} must be an actual boolean"
+            )
+        gold_bool = row["answer"]
+        metadata = {"title": str(row.get("title", ""))}
+        if "replay_input_ids" in predictions[example_id]:
+            replay_ids = predictions[example_id]["replay_input_ids"]
+            if not isinstance(replay_ids, list) or not all(
+                isinstance(token_id, int) for token_id in replay_ids
+            ):
+                raise ValueError(
+                    f"BoolQ replay_input_ids for {example_id!r} must be integer ids"
+                )
+            metadata["replay_input_ids"] = replay_ids
         examples.append(
             compose_example(
                 str(row["passage"]),
@@ -160,7 +199,8 @@ def load_boolq_predictions(
                 example_id=example_id,
                 pair_id=example_id,
                 dataset="boolq",
-                metadata={"title": str(row.get("title", ""))},
+                metadata=metadata,
+                answer_header=BOOLQ_ANSWER_HEADER,
             )
         )
         evaluation_labels[example_id] = int(predicted_bool != gold_bool)
@@ -204,9 +244,15 @@ def write_prepared_dataset(
 
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
+    if not examples:
+        raise ValueError("at least one prepared example is required")
     example_ids = {example.example_id for example in examples}
+    if len(example_ids) != len(examples):
+        raise ValueError("prepared example ids must be unique")
     if set(evaluation_labels) != example_ids:
         raise ValueError("evaluation labels must match the prepared example ids")
+    if any(int(label) not in (0, 1) for label in evaluation_labels.values()):
+        raise ValueError("evaluation labels must be binary")
     example_path = output_directory / "examples.jsonl"
     label_path = output_directory / "evaluation_labels.jsonl"
     example_lines = [
@@ -234,14 +280,19 @@ def read_prepared_examples(path: str | Path) -> list[TokenGraphExample]:
     """Read the label-free examples file without opening its label sidecar."""
 
     examples = []
+    seen_ids = set()
     for row in _read_records(path):
+        example_id = str(row["example_id"])
+        if example_id in seen_ids:
+            raise ValueError(f"Duplicate prepared example id {example_id!r}")
+        seen_ids.add(example_id)
         spans = {
             name: (int(span[0]), int(span[1]))
             for name, span in row["segment_char_spans"].items()
         }
         examples.append(
             TokenGraphExample(
-                example_id=str(row["example_id"]),
+                example_id=example_id,
                 pair_id=str(row["pair_id"]),
                 dataset=str(row["dataset"]),
                 passage=str(row["passage"]),
@@ -263,7 +314,10 @@ def read_evaluation_labels(path: str | Path) -> dict[str, int]:
         label = int(row["label"])
         if label not in (0, 1):
             raise ValueError("evaluation labels must be binary")
-        labels[str(row["example_id"])] = label
+        example_id = str(row["example_id"])
+        if example_id in labels:
+            raise ValueError(f"Duplicate evaluation label id {example_id!r}")
+        labels[example_id] = label
     return labels
 
 

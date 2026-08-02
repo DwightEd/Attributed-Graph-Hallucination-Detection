@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from unsupervised_token_graph.data import (
     compose_example,
@@ -13,6 +14,10 @@ from unsupervised_token_graph.data import (
     load_halueval_qa,
 )
 from unsupervised_token_graph.features import summarize_attention_trace
+from unsupervised_token_graph.generate_boolq import (
+    build_boolq_generation_prompt,
+    generate_boolq_predictions,
+)
 from unsupervised_token_graph.scoring import RobustMahalanobisScorer
 
 
@@ -121,10 +126,110 @@ class DatasetAdapterContractTests(unittest.TestCase):
         self.assertEqual(evaluation_labels["false-answered-yes"], 1)
         self.assertEqual(_field(examples_by_id["false-answered-no"], "answer"), "No.")
         self.assertEqual(_field(examples_by_id["false-answered-yes"], "answer"), "Yes.")
+        self.assertEqual(
+            _field(examples_by_id["false-answered-no"], "text"),
+            build_boolq_generation_prompt(
+                boolq_rows[0]["passage"], boolq_rows[0]["question"]
+            )
+            + "No.",
+        )
 
         for example in examples:
             self.assertNotIn("gold_answer", _record_fields(example))
             self.assertNotIn("is_hallucinated", _record_fields(example))
+
+    def test_boolq_generation_prompt_has_no_gold_answer_input(self):
+        parameters = inspect.signature(build_boolq_generation_prompt).parameters
+        self.assertEqual(list(parameters), ["passage", "question"])
+
+        prompt = build_boolq_generation_prompt(
+            "The passage states the evidence.",
+            "Does the passage state the evidence?",
+        )
+
+        self.assertIn("The passage states the evidence.", prompt)
+        self.assertIn("Does the passage state the evidence?", prompt)
+        self.assertIn("Yes or No", prompt)
+
+    def test_boolq_resume_rejects_predictions_from_another_model(self):
+        class FakeTokenizer:
+            eos_token_id = 0
+
+            def __call__(self, prompt, **options):
+                return {
+                    "input_ids": torch.tensor([[1, 2]]),
+                    "attention_mask": torch.ones((1, 2), dtype=torch.long),
+                }
+
+            def decode(self, tokens, **options):
+                return "Yes"
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.anchor = torch.nn.Parameter(torch.zeros(()))
+
+            def generate(self, input_ids, **options):
+                suffix = torch.tensor([[3]], device=input_ids.device)
+                return torch.cat((input_ids, suffix), dim=1)
+
+        records = [{"id": "example", "passage": "P", "question": "Q?"}]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "predictions.jsonl"
+            generate_boolq_predictions(
+                FakeModel(),
+                FakeTokenizer(),
+                records,
+                output_path=output,
+                model_id="model-a",
+                max_input_tokens=16,
+                max_new_tokens=2,
+            )
+            generated_row = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(generated_row["replay_input_ids"], [1, 2, 3])
+
+            with self.assertRaisesRegex(RuntimeError, "stale BoolQ prediction"):
+                generate_boolq_predictions(
+                    FakeModel(),
+                    FakeTokenizer(),
+                    records,
+                    output_path=output,
+                    model_id="model-b",
+                    max_input_tokens=16,
+                    max_new_tokens=2,
+                )
+
+    def test_dataset_adapters_reject_ambiguous_ids_and_non_boolean_boolq_gold(self):
+        duplicate_halueval = {
+            "knowledge": "K",
+            "question": "Q?",
+            "right_answer": "same",
+            "hallucinated_answer": "same",
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            halueval_path = root / "halueval.json"
+            halueval_path.write_text(
+                json.dumps([duplicate_halueval]), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "identical candidates"):
+                load_halueval_qa(halueval_path)
+
+            boolq_path = root / "boolq.jsonl"
+            predictions_path = root / "predictions.jsonl"
+            boolq_path.write_text(
+                json.dumps(
+                    {"id": "x", "passage": "P", "question": "Q?", "answer": "false"}
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            predictions_path.write_text(
+                json.dumps({"id": "x", "model_answer": "No"}) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "actual boolean"):
+                load_boolq_predictions(boolq_path, predictions_path)
 
 
 class ExampleCompositionTests(unittest.TestCase):
@@ -166,11 +271,12 @@ class AttentionFeatureTests(unittest.TestCase):
     def test_summary_keeps_answer_attention_mass_to_each_input_segment_separate(self):
         attention = np.zeros((1, 1, 6, 6), dtype=np.float64)
         attention[:, :, :4, :] = 1.0 / 6.0
-        answer_query_distribution = np.array(
-            [0.35, 0.35, 0.10, 0.10, 0.05, 0.05],
-            dtype=np.float64,
+        attention[:, :, 4, :] = np.array(
+            [0.35, 0.35, 0.10, 0.10, 0.10, 0.00], dtype=np.float64
         )
-        attention[:, :, 4:6, :] = answer_query_distribution
+        attention[:, :, 5, :] = np.array(
+            [0.35, 0.35, 0.10, 0.10, 0.05, 0.05], dtype=np.float64
+        )
         segment_token_spans = {
             "passage": (0, 2),
             "question": (2, 4),
@@ -184,9 +290,16 @@ class AttentionFeatureTests(unittest.TestCase):
         answer_mass = _mean_scalar(summary["answer_to_answer_mass"])
         self.assertAlmostEqual(passage_mass, 0.70)
         self.assertAlmostEqual(question_mass, 0.20)
-        self.assertAlmostEqual(answer_mass, 0.10)
+        self.assertAlmostEqual(answer_mass, 0.025)
+        self.assertAlmostEqual(
+            _mean_scalar(summary["answer_to_prior_answer_mass"]), 0.025
+        )
         self.assertGreater(passage_mass, question_mass)
         self.assertGreater(question_mass, answer_mass)
+        self.assertGreater(
+            _mean_scalar(summary["answer_to_passage_token_normalized"]),
+            _mean_scalar(summary["answer_to_question_token_normalized"]),
+        )
 
 
 class RobustMahalanobisScorerTests(unittest.TestCase):

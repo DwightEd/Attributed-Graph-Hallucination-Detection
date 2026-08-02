@@ -22,6 +22,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--predictions",
         help="BoolQ JSONL with id/model_answer; forbidden for HaluEval-QA",
     )
+    parser.add_argument(
+        "--allow-missing-predictions",
+        action="store_true",
+        help="Prepare only BoolQ rows that have generated predictions",
+    )
     parser.add_argument("--output-dir", required=True)
     return parser
 
@@ -29,13 +34,17 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.dataset == "halueval_qa":
-        if args.predictions:
-            raise SystemExit("--predictions is only valid for BoolQ")
+        if args.predictions or args.allow_missing_predictions:
+            raise SystemExit("BoolQ prediction options are invalid for HaluEval-QA")
         examples, labels = load_halueval_qa(args.input)
     else:
         if not args.predictions:
             raise SystemExit("BoolQ requires --predictions with generated model answers")
-        examples, labels = load_boolq_predictions(args.input, args.predictions)
+        examples, labels = load_boolq_predictions(
+            args.input,
+            args.predictions,
+            allow_missing=args.allow_missing_predictions,
+        )
     paths = write_prepared_dataset(examples, labels, args.output_dir)
     print(
         json.dumps(

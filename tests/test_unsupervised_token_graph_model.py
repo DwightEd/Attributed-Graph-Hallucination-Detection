@@ -6,6 +6,7 @@ import torch
 from unsupervised_token_graph.graph import build_token_graph
 from unsupervised_token_graph.model import (
     TokenGraphMaskedAutoencoder,
+    _mask_incident_edge_attributes,
     make_answer_block_mask,
     masked_reconstruction_loss,
 )
@@ -85,6 +86,23 @@ class TokenGraphConstructionTests(unittest.TestCase):
             ).to(torch.float32)
             torch.testing.assert_close(edge_marks[edge_position], expected)
 
+    def test_edge_attributes_keep_original_threshold_masking(self):
+        attention = torch.zeros((1, 2, 3, 3), dtype=torch.float32)
+        attention[0, 0, 2, 0] = 0.20
+        attention[0, 1, 2, 0] = 0.01
+
+        graph = build_token_graph(
+            torch.tensor([10, 20, 30]),
+            attention,
+            torch.tensor([1, 2, 3]),
+            tau=0.05,
+        )
+
+        self.assertEqual(graph["edge_index"].tolist(), [[0], [2]])
+        torch.testing.assert_close(
+            graph["edge_attr"], torch.tensor([[0.20, 0.0]])
+        )
+
 
 class MaskedAutoencoderContractTests(unittest.TestCase):
     def test_answer_block_mask_never_masks_template_passage_or_question(self):
@@ -118,6 +136,31 @@ class MaskedAutoencoderContractTests(unittest.TestCase):
 
         torch.testing.assert_close(loss, torch.tensor(2.0))
         torch.testing.assert_close(changed_loss, loss)
+
+    def test_batched_reconstruction_gives_each_graph_equal_weight(self):
+        predictions = torch.tensor([[1.0], [3.0], [3.0], [3.0]])
+        targets = torch.zeros_like(predictions)
+        masked_nodes = torch.ones(4, dtype=torch.bool)
+
+        loss = masked_reconstruction_loss(
+            predictions,
+            targets,
+            masked_nodes,
+            graph_ptr=torch.tensor([0, 1, 4]),
+        )
+
+        torch.testing.assert_close(loss, torch.tensor(5.0))
+
+    def test_masked_query_attention_values_cannot_leak_through_incident_edges(self):
+        edge_index = torch.tensor([[0, 1, 2], [1, 2, 3]])
+        edge_attr = torch.tensor([[1.0], [2.0], [3.0]])
+        masked_nodes = torch.tensor([False, False, True, False])
+
+        masked = _mask_incident_edge_attributes(
+            edge_index, edge_attr, masked_nodes
+        )
+
+        torch.testing.assert_close(masked, torch.tensor([[1.0], [0.0], [0.0]]))
 
     def test_model_is_pure_pytorch_and_its_training_signature_has_no_labels(self):
         forward_parameters = list(

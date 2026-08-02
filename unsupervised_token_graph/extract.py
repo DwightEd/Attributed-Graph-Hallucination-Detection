@@ -14,7 +14,18 @@ import torch
 from .data import TokenGraphExample, read_prepared_examples
 from .features import summarize_attention_trace
 from .graph import build_token_graph
+from .identity import model_source_signature
 from .trace import assign_segment_ids
+
+
+def _estimate_attention_storage_bytes(
+    num_layers: int,
+    num_heads: int,
+    token_count: int,
+) -> int:
+    """Estimate the float32 CPU attention tensor retained by this extractor."""
+
+    return int(num_layers) * int(num_heads) * int(token_count) ** 2 * 4
 
 
 def _unbatch(value):
@@ -43,6 +54,12 @@ def tokenize_example_once(
         truncation=False,
     )
     input_ids = torch.as_tensor(_unbatch(encoded["input_ids"]), dtype=torch.long)
+    replay_input_ids = example.metadata.get("replay_input_ids")
+    if replay_input_ids is not None and input_ids.tolist() != list(replay_input_ids):
+        raise ValueError(
+            f"BoolQ example {example.example_id!r} does not retokenize to the exact "
+            "generation ids; refusing an inexact attention replay"
+        )
     if max_tokens is not None and len(input_ids) > max_tokens:
         raise ValueError(
             f"example {example.example_id!r} has {len(input_ids)} tokens and "
@@ -100,10 +117,24 @@ def extract_example_trace(
     *,
     selected_hidden_layers: Sequence[int],
     max_tokens: int | None = None,
+    max_attention_bytes: int | None = None,
 ) -> dict[str, object]:
     """Run one teacher-forced forward pass and return a label-free trace."""
 
     encoded = tokenize_example_once(tokenizer, example, max_tokens=max_tokens)
+    config = getattr(model, "config", None)
+    if max_attention_bytes is not None and config is not None:
+        estimated = _estimate_attention_storage_bytes(
+            int(config.num_hidden_layers),
+            int(config.num_attention_heads),
+            len(encoded["input_ids"]),
+        )
+        if estimated > max_attention_bytes:
+            raise MemoryError(
+                f"example {example.example_id!r} would retain approximately "
+                f"{estimated / 1024**3:.2f} GiB of float32 attention; limit is "
+                f"{max_attention_bytes / 1024**3:.2f} GiB"
+            )
     try:
         device = next(model.parameters()).device
     except (StopIteration, AttributeError):
@@ -183,7 +214,9 @@ def summarize_trace_record(trace: dict[str, object]) -> dict[str, object]:
 
     segment_ids = torch.as_tensor(trace["segment_ids"], dtype=torch.long)
     summary = summarize_attention_trace(
-        trace["attention"], _token_spans(segment_ids)
+        trace["attention"],
+        _token_spans(segment_ids),
+        edge_threshold=float(trace.get("edge_threshold", 0.05)),
     )
     record: dict[str, object] = {
         "example_id": str(trace["example_id"]),
@@ -233,16 +266,23 @@ def _fingerprint(
     model_id: str,
     selected_layers: Sequence[int],
     tau: float,
+    include_prefix_edges: bool,
     include_hidden_nodes: bool,
+    *,
+    max_tokens: int | None = None,
+    model_signature: str | None = None,
 ) -> str:
     payload = json.dumps(
         {
-            "schema": "token_trace_v1",
+            "schema": "token_trace_graph_v2",
             "text": example.text,
-            "model": model_id,
+            "model_id": model_id,
+            "model_signature": model_signature or model_id,
             "layers": list(selected_layers),
             "tau": tau,
+            "include_prefix_edges": include_prefix_edges,
             "include_hidden_nodes": include_hidden_nodes,
+            "max_tokens": max_tokens,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -254,6 +294,13 @@ def _atomic_torch_save(value, path: Path) -> None:
     temporary_path = path.with_suffix(path.suffix + ".tmp")
     torch.save(value, temporary_path)
     temporary_path.replace(path)
+
+
+def _artifact_path(directory: Path, example_id: str) -> Path:
+    """Map an external example id to a contained, filesystem-safe path."""
+
+    digest = hashlib.sha256(str(example_id).encode("utf-8")).hexdigest()[:32]
+    return directory / f"{digest}.pt"
 
 
 def extract_prepared_dataset(
@@ -269,6 +316,8 @@ def extract_prepared_dataset(
     include_prefix_edges: bool,
     include_hidden_nodes: bool,
     overwrite: bool = False,
+    model_signature: str | None = None,
+    max_attention_bytes: int | None = None,
 ) -> dict[str, object]:
     """Extract traces, token graphs, and scalar pattern features without labels."""
 
@@ -279,20 +328,51 @@ def extract_prepared_dataset(
     graph_directory.mkdir(parents=True, exist_ok=True)
     feature_records = []
     for position, example in enumerate(examples, start=1):
-        trace_path = trace_directory / f"{example.example_id}.pt"
-        graph_path = graph_directory / f"{example.example_id}.pt"
+        trace_path = _artifact_path(trace_directory, example.example_id)
+        graph_path = _artifact_path(graph_directory, example.example_id)
         fingerprint = _fingerprint(
             example,
             model_id,
             selected_hidden_layers,
             tau,
+            include_prefix_edges,
             include_hidden_nodes,
+            max_tokens=max_tokens,
+            model_signature=model_signature,
         )
         if trace_path.exists() and graph_path.exists() and not overwrite:
-            trace = torch.load(trace_path, map_location="cpu", weights_only=False)
+            trace = torch.load(trace_path, map_location="cpu", weights_only=True)
             if trace.get("extraction_fingerprint") != fingerprint:
                 raise RuntimeError(
                     f"Stale extraction cache for {example.example_id}; use --overwrite"
+                )
+            if max_tokens is not None and len(trace["input_ids"]) > max_tokens:
+                raise RuntimeError(
+                    f"Cached example {example.example_id!r} exceeds max_tokens="
+                    f"{max_tokens}; use --overwrite only after changing the input"
+                )
+            attention_shape = torch.as_tensor(trace["attention"]).shape
+            estimated = _estimate_attention_storage_bytes(
+                attention_shape[0], attention_shape[1], attention_shape[-1]
+            )
+            if max_attention_bytes is not None and estimated > max_attention_bytes:
+                raise RuntimeError(
+                    f"Cached example {example.example_id!r} exceeds the configured "
+                    "attention storage limit"
+                )
+            graph = torch.load(graph_path, map_location="cpu", weights_only=True)
+            if (
+                graph.get("extraction_fingerprint") != fingerprint
+                or str(graph.get("example_id")) != example.example_id
+            ):
+                raise RuntimeError(
+                    f"Stale or mismatched graph cache for {example.example_id}; "
+                    "use --overwrite"
+                )
+            if str(trace.get("example_id")) != example.example_id:
+                raise RuntimeError(
+                    f"Stale or mismatched trace cache for {example.example_id}; "
+                    "use --overwrite"
                 )
         else:
             trace = extract_example_trace(
@@ -301,9 +381,11 @@ def extract_prepared_dataset(
                 example,
                 selected_hidden_layers=selected_hidden_layers,
                 max_tokens=max_tokens,
+                max_attention_bytes=max_attention_bytes,
             )
             trace["extractor_model_id"] = model_id
             trace["extraction_fingerprint"] = fingerprint
+            trace["edge_threshold"] = float(tau)
             graph = build_token_graph(
                 trace["input_ids"],
                 trace["attention"],
@@ -311,6 +393,7 @@ def extract_prepared_dataset(
                 hidden_states=(trace["hidden_states"] if include_hidden_nodes else None),
                 token_log_probs=trace["token_log_prob"],
                 next_token_entropy=trace["next_token_entropy"],
+                token_stat_valid=trace["token_stat_valid"],
                 tau=tau,
                 include_prefix_edges=include_prefix_edges,
             )
@@ -345,13 +428,20 @@ def extract_prepared_dataset(
         "state": "complete",
         "examples": len(examples),
         "model_id": model_id,
+        "model_signature": model_signature or model_id,
         "selected_hidden_layers": list(selected_hidden_layers),
         "max_tokens": max_tokens,
         "tau": tau,
         "include_prefix_edges": include_prefix_edges,
         "include_hidden_nodes": include_hidden_nodes,
+        "max_attention_bytes": max_attention_bytes,
         "trace_dir": str(trace_directory),
         "graph_dir": str(graph_directory),
+        "graph_files": [
+            _artifact_path(graph_directory, example.example_id).name
+            for example in examples
+        ],
+        "example_ids": [example.example_id for example in examples],
         "features": str(feature_path),
     }
     (output_directory / "extraction_manifest.json").write_text(
@@ -367,6 +457,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-tokens", type=int)
+    parser.add_argument(
+        "--max-attention-gib",
+        type=float,
+        default=12.0,
+        help="Refuse a sample whose retained float32 attention exceeds this estimate",
+    )
     parser.add_argument("--probe-layers", help="Comma-separated hidden-state indices")
     parser.add_argument("--tau", type=float, default=0.05)
     parser.add_argument("--drop-prefix-edges", action="store_true")
@@ -392,6 +488,7 @@ def main(argv: list[str] | None = None) -> int:
         attn_implementation="eager",
     ).to(args.device)
     model.eval()
+    source_signature = model_source_signature(args.model, model=model, tokenizer=tokenizer)
     examples = read_prepared_examples(args.examples)
     if args.limit is not None:
         examples = examples[: args.limit]
@@ -411,6 +508,8 @@ def main(argv: list[str] | None = None) -> int:
         include_prefix_edges=not args.drop_prefix_edges,
         include_hidden_nodes=args.include_hidden_nodes,
         overwrite=args.overwrite,
+        model_signature=source_signature,
+        max_attention_bytes=int(args.max_attention_gib * 1024**3),
     )
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
     return 0

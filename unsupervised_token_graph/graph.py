@@ -18,6 +18,7 @@ def build_token_graph(
     hidden_states=None,
     token_log_probs=None,
     next_token_entropy=None,
+    token_stat_valid=None,
     tau: float = 0.05,
     include_prefix_edges: bool = True,
 ) -> dict[str, object]:
@@ -61,12 +62,28 @@ def build_token_graph(
     if token_log_probs is not None:
         log_probs = _float_tensor(token_log_probs).reshape(token_count, 1)
         node_views["token_log_prob"] = torch.nan_to_num(log_probs)
-        node_views["token_log_prob_valid"] = torch.isfinite(log_probs).float()
+        valid = (
+            _float_tensor(token_stat_valid).reshape(token_count, 1)
+            if token_stat_valid is not None
+            else torch.isfinite(log_probs).float()
+        )
+        node_views["token_log_prob_valid"] = valid
     if next_token_entropy is not None:
         entropy = _float_tensor(next_token_entropy).reshape(token_count, 1)
         node_views["next_token_entropy"] = torch.nan_to_num(entropy)
-        node_views["next_token_entropy_valid"] = torch.isfinite(entropy).float()
+        valid = (
+            _float_tensor(token_stat_valid).reshape(token_count, 1)
+            if token_stat_valid is not None
+            else torch.isfinite(entropy).float()
+        )
+        node_views["next_token_entropy_valid"] = valid
     x = torch.cat(list(node_views.values()), dim=1)
+    x_view_slices = {}
+    view_start = 0
+    for name, view in node_views.items():
+        view_end = view_start + view.shape[1]
+        x_view_slices[name] = (view_start, view_end)
+        view_start = view_end
 
     edge_presence = values.amax(dim=(0, 1)) > float(tau)
     causal = torch.tril(
@@ -77,20 +94,22 @@ def build_token_graph(
         edge_presence &= (segments == 3).unsqueeze(1)
     target, source = torch.nonzero(edge_presence, as_tuple=True)
     edge_index = torch.stack((source, target), dim=0)
-    edge_attr = values[:, :, target, source].permute(2, 0, 1).reshape(
-        len(source), -1
+    edge_values = values[:, :, target, source]
+    edge_values = torch.where(
+        edge_values > float(tau), edge_values, torch.zeros_like(edge_values)
     )
+    edge_attr = edge_values.permute(2, 0, 1).reshape(len(source), -1)
     source_mark = F.one_hot(segments[source], num_classes=4)
     target_mark = F.one_hot(segments[target], num_classes=4)
     edge_mark = torch.cat((source_mark, target_mark), dim=1).float()
 
     return {
-        "schema_version": "token_graph_v1",
+        "schema_version": "token_graph_v2",
         "token_ids": token_ids,
         "segment_ids": segments,
         "answer_mask": segments == 3,
         "x": x,
-        "x_views": node_views,
+        "x_view_slices": x_view_slices,
         "edge_index": edge_index,
         "edge_attr": edge_attr,
         "edge_mark": edge_mark,
