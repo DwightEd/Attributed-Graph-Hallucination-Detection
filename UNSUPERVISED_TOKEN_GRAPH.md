@@ -79,6 +79,9 @@ export RUN_DIR=/path/to/output/halueval_token_graph_pilot
 export PILOT_LIMIT=300
 export MAX_TOKENS=1024
 export MAX_ATTENTION_GIB=12
+export POSTPROCESS_DEVICE=auto
+export RETAIN_DENSE_ATTENTION=0
+export CPU_THREADS=4
 export RUN_TRAINING=0
 
 bash ./run_unsupervised_token_graph_pilot.sh
@@ -146,6 +149,8 @@ python -m unsupervised_token_graph.extract \
   --output-dir outputs/halueval/extraction \
   --max-tokens 1024 \
   --max-attention-gib 12 \
+  --postprocess-device auto \
+  --discard-dense-attention \
   --limit 300
 ```
 
@@ -160,10 +165,12 @@ python -m unsupervised_token_graph.extract \
 
 输出：
 
-- `traces/*.pt`：attention、六个 probe hidden states、log-probability、entropy；
+- `traces/*.pt`：六个 probe hidden states、log-probability、entropy、已冻结的标量特征；加 `--discard-dense-attention` 时只记录原 attention shape，不保存巨大 tensor；
 - `graphs/*.pt`：无标签 token 属性图；
 - `features.jsonl`：用于先看模式的标量特征；
 - `extraction_manifest.json`：模型、层、构图和缓存信息。
+
+`--postprocess-device auto` 会在显存足够时用模型 GPU 构图和归约，显存不足时自动回退 CPU；`model` 强制使用模型设备，可能 OOM，通常只用于确认显存充裕的短样本。原始 dense attention 若被丢弃，之后更换构图阈值或增加新的 attention 统计必须重新 forward。
 
 ### 3. 先做模式审计
 

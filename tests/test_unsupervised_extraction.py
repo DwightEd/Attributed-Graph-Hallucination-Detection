@@ -10,6 +10,7 @@ from unsupervised_token_graph.extract import (
     _artifact_path,
     _estimate_attention_storage_bytes,
     _fingerprint,
+    _resolve_postprocess_device,
     compute_teacher_forced_statistics,
     extract_example_trace,
     extract_prepared_dataset,
@@ -179,6 +180,71 @@ class SingleTokenizationTests(unittest.TestCase):
 
         self.assertNotEqual(float16, bfloat16)
 
+    def test_cache_fingerprint_changes_when_dense_attention_policy_changes(self):
+        example = compose_example("P", "Q", "A", example_id="sample")
+
+        retained = _fingerprint(
+            example,
+            "model-a",
+            (1,),
+            0.05,
+            True,
+            False,
+            retain_dense_attention=True,
+        )
+        discarded = _fingerprint(
+            example,
+            "model-a",
+            (1,),
+            0.05,
+            True,
+            False,
+            retain_dense_attention=False,
+        )
+
+        self.assertNotEqual(retained, discarded)
+
+        cpu_postprocess = _fingerprint(
+            example,
+            "model-a",
+            (1,),
+            0.05,
+            True,
+            False,
+            postprocess_device="cpu",
+        )
+        model_postprocess = _fingerprint(
+            example,
+            "model-a",
+            (1,),
+            0.05,
+            True,
+            False,
+            postprocess_device="model",
+        )
+        self.assertNotEqual(cpu_postprocess, model_postprocess)
+
+    def test_auto_postprocess_uses_model_device_only_with_memory_headroom(self):
+        cuda = torch.device("cuda:0")
+
+        enough = _resolve_postprocess_device(
+            "auto",
+            cuda,
+            attention_bytes=100,
+            cuda_free_bytes=411,
+            reserve_bytes=10,
+        )
+        insufficient = _resolve_postprocess_device(
+            "auto",
+            cuda,
+            attention_bytes=100,
+            cuda_free_bytes=409,
+            reserve_bytes=10,
+        )
+
+        self.assertEqual(enough, cuda)
+        self.assertEqual(insufficient, torch.device("cpu"))
+
     def test_cache_fingerprint_includes_exact_generation_replay(self):
         first = compose_example(
             "P",
@@ -311,6 +377,7 @@ class ExtractionCacheIntegrityTests(unittest.TestCase):
                 "include_prefix_edges": True,
                 "include_hidden_nodes": False,
                 "extraction_dtype": "float16",
+                "retain_dense_attention": False,
             }
             extract_prepared_dataset(
                 _FakeModel(), _FakeTokenizer(example), [example], **options
@@ -323,6 +390,133 @@ class ExtractionCacheIntegrityTests(unittest.TestCase):
             resumed_features = (output / "features.jsonl").read_bytes()
 
         self.assertEqual(first_features, resumed_features)
+
+    def test_changed_extraction_dtype_rejects_existing_cache_end_to_end(self):
+        example = compose_example("P", "Q", "A", example_id="sample")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "extraction"
+            options = {
+                "output_dir": output,
+                "model_id": "fake-model",
+                "selected_hidden_layers": (1,),
+                "max_tokens": 8,
+                "tau": 0.05,
+                "include_prefix_edges": True,
+                "include_hidden_nodes": False,
+                "retain_dense_attention": False,
+            }
+            extract_prepared_dataset(
+                _FakeModel(),
+                _FakeTokenizer(example),
+                [example],
+                extraction_dtype="float16",
+                **options,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "Stale extraction cache"):
+                extract_prepared_dataset(
+                    _FakeModel(),
+                    _FakeTokenizer(example),
+                    [example],
+                    extraction_dtype="bfloat16",
+                    **options,
+                )
+
+    def test_discarded_dense_attention_has_cached_features_and_portable_tensors(self):
+        example = compose_example("P", "Q", "A", example_id="sample")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "extraction"
+            manifest = extract_prepared_dataset(
+                _FakeModel(),
+                _FakeTokenizer(example),
+                [example],
+                output_dir=output,
+                model_id="fake-model",
+                selected_hidden_layers=(1,),
+                max_tokens=8,
+                tau=0.05,
+                include_prefix_edges=True,
+                include_hidden_nodes=False,
+                extraction_dtype="float16",
+                retain_dense_attention=False,
+            )
+            trace = torch.load(
+                next((output / "traces").glob("*.pt")),
+                weights_only=True,
+            )
+            graph = torch.load(
+                next((output / "graphs").glob("*.pt")),
+                weights_only=True,
+            )
+
+        self.assertNotIn("attention", trace)
+        self.assertEqual(trace["attention_shape"], [1, 1, 4, 4])
+        self.assertEqual(trace["attention_storage"], "discarded_after_postprocessing")
+        self.assertIn("feature_record", trace)
+        self.assertEqual(trace["hidden_states"].dtype, torch.float16)
+        self.assertEqual(manifest["postprocess_device_counts"], {"cpu": 1})
+        self.assertEqual(manifest["extracted_examples"], 1)
+        self.assertEqual(manifest["reused_examples"], 0)
+
+        def tensor_leaves(value):
+            if isinstance(value, torch.Tensor):
+                yield value
+            elif isinstance(value, dict):
+                for child in value.values():
+                    yield from tensor_leaves(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    yield from tensor_leaves(child)
+
+        self.assertTrue(all(value.device.type == "cpu" for value in tensor_leaves(trace)))
+        self.assertTrue(all(value.device.type == "cpu" for value in tensor_leaves(graph)))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_gpu_postprocessing_still_persists_cpu_portable_artifacts(self):
+        example = compose_example("P", "Q", "A", example_id="sample")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "extraction"
+            manifest = extract_prepared_dataset(
+                _FakeModel().to("cuda:0"),
+                _FakeTokenizer(example),
+                [example],
+                output_dir=output,
+                model_id="fake-model",
+                selected_hidden_layers=(1,),
+                max_tokens=8,
+                tau=0.05,
+                include_prefix_edges=True,
+                include_hidden_nodes=False,
+                extraction_dtype="float16",
+                postprocess_device="model",
+                retain_dense_attention=False,
+            )
+            trace = torch.load(
+                next((output / "traces").glob("*.pt")),
+                weights_only=True,
+            )
+            graph = torch.load(
+                next((output / "graphs").glob("*.pt")),
+                weights_only=True,
+            )
+
+        self.assertEqual(trace["postprocess_device"], "cuda:0")
+        self.assertEqual(manifest["postprocess_device_counts"], {"cuda:0": 1})
+
+        def tensor_leaves(value):
+            if isinstance(value, torch.Tensor):
+                yield value
+            elif isinstance(value, dict):
+                for child in value.values():
+                    yield from tensor_leaves(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    yield from tensor_leaves(child)
+
+        for artifact in (trace, graph):
+            self.assertTrue(
+                all(value.device.type == "cpu" for value in tensor_leaves(artifact))
+            )
 
     def test_cached_trace_and_graph_fingerprints_must_both_match(self):
         example = compose_example("P", "Q", "A", example_id="sample")

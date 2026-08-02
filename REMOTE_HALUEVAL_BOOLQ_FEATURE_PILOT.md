@@ -9,7 +9,11 @@
 - 下载器把 URL、版本、行数、字节数和 SHA256 写到 `${DATA_ROOT}/hallucination_datasets/dataset_manifest.json`。后续运行若哈希变化会拒绝继续。
 - 默认 pilot 抽取 64 个 HaluEval candidate（32 个 pair）和 64 个 BoolQ dev 回答；同一 GPU 上严格顺序运行。
 
-每条输入均固定拼接为 `passage/knowledge + question + candidate/generated answer`。同一次 teacher-forced forward 保存全层 attention、六个 probe hidden state、token log-probability/entropy、token 属性图和标量审计特征。evaluation label 保存在独立 sidecar，特征抽取阶段不读取它。
+每条输入均固定拼接为 `passage/knowledge + question + candidate/generated answer`。同一次 teacher-forced forward 生成全层 attention、六个 probe hidden state、token log-probability/entropy、token 属性图和标量审计特征。pilot 默认在图和特征生成后丢弃原始 dense attention，只保留图、hidden state 和标量特征；evaluation label 保存在独立 sidecar，特征抽取阶段不读取它。
+
+模型前向始终在 GPU。`POSTPROCESS_DEVICE=auto` 会在显存有保守余量时也用 GPU 完成 attention 阈值构图和特征归约，长样本显存不足时逐样本回退 CPU。tokenize、JSON、哈希和 `.pt` 落盘仍需要 CPU；完整逐层逐头 attention 与 FlashAttention/SDPA 不兼容，因此这里继续使用 eager attention。
+
+v4 后处理只把 answer rows、阈值最大值和已选边转为 float32，不再把完整 attention 复制成 NumPy float64。它与旧特征定义在容差内等价，但不承诺逐 bit 相同，因此使用新的 fingerprint schema，且把每条最终 `feature_record` 缓存在 trace 中供断点恢复直接复用。
 
 BoolQ 生成阶段会保存模型实际看到的完整 token IDs、attention mask 和 passage/question/answer segment IDs；抽取阶段直接回放这些 token，不以不可靠的 `decode → retokenize` 结果作为门禁。
 若模型没有以 Yes/No 开头作答，该条会写入 `boolq_predictions.jsonl.invalid.jsonl` 并从本轮 pilot 跳过，不会让之前已经生成的有效样本全部作废。
@@ -33,6 +37,7 @@ env DATA_ROOT="$DATA_ROOT" PYTHON_BIN="$PYTHON_BIN" FORCE_DOWNLOAD=1 \
   bash ./download_halueval_boolq.sh
 
 # 只验证这次新增的纯代码契约；不会加载真实模型或数据到 GPU。
+"$PYTHON_BIN" -m unittest discover -s tests -p 'test_gpu_postprocessing.py'
 "$PYTHON_BIN" -m unittest discover -s tests -p 'test_unsupervised_extraction.py'
 "$PYTHON_BIN" -m unittest discover -s tests -p 'test_unsupervised_pattern_audit.py'
 "$PYTHON_BIN" -m unittest discover -s tests -p 'test_unsupervised_token_graph.py'
@@ -40,7 +45,7 @@ env DATA_ROOT="$DATA_ROOT" PYTHON_BIN="$PYTHON_BIN" FORCE_DOWNLOAD=1 \
 
 nvidia-smi
 
-RUN_ROOT="$DATA_ROOT/feature_extraction/token_graph_pilot_v3_64"
+RUN_ROOT="$DATA_ROOT/feature_extraction/token_graph_pilot_v4_gpu_64"
 mkdir -p "$RUN_ROOT"
 
 nohup env \
@@ -52,6 +57,9 @@ nohup env \
   PILOT_LIMIT=64 \
   MAX_TOKENS=1024 \
   MAX_ATTENTION_GIB=6 \
+  POSTPROCESS_DEVICE=auto \
+  RETAIN_DENSE_ATTENTION=0 \
+  CPU_THREADS=4 \
   RUN_ROOT="$RUN_ROOT" \
   DOWNLOAD_DATA=0 \
   bash ./run_halueval_boolq_feature_pilots.sh \
@@ -69,14 +77,14 @@ tail -n 200 -f "$RUN_ROOT/pilot.log"
 另开终端查看 GPU 和已保存文件：
 
 ```bash
-nvidia-smi
+nvidia-smi dmon -s pucvmet -d 2
 
 find "$RUN_ROOT" -path '*/extraction/traces/*.pt' -type f | wc -l
 find "$RUN_ROOT" -path '*/extraction/graphs/*.pt' -type f | wc -l
 du -sh "$RUN_ROOT"
 ```
 
-日志必须先出现一行 `"event": "GPU_WITNESS"`，之后依次出现 `Starting halueval_qa` 和 `Starting boolq`。同一 `RUN_ROOT` 重跑会按模型签名、dtype、文本、层和构图参数校验 fingerprint，然后复用已经完整保存的样本。
+日志必须先出现一行 `"event": "GPU_WITNESS"`，之后依次出现 `Starting halueval_qa` 和 `Starting boolq`。进度行中的 `postprocess=cuda:0` 表示该样本的构图/归约也在 GPU；`postprocess=cpu` 表示显存保护已自动回退。完成后的 `extraction_manifest.json` 会汇总两种设备各处理多少条。同一 `RUN_ROOT` 重跑会按模型签名、dtype、文本、层和构图参数校验 fingerprint，然后复用已经完整保存的样本。
 
 完成后优先阅读：
 
@@ -88,6 +96,6 @@ ${RUN_ROOT}/boolq/pattern_audit/pattern_audit.md
 ${RUN_ROOT}/boolq/pattern_audit/evaluation_error_cases.jsonl
 ```
 
-注意：全层全头 dense attention 的时间和磁盘复杂度是 `O(layers × heads × tokens²)`。因此第一轮不要直接把 `PILOT_LIMIT` 改成 10,000。先确认 64 条的运行时间、磁盘占用、BoolQ 自然错误数量以及错误模式方向，再扩大到 300。
+注意：全层全头 dense attention 的计算复杂度是 `O(layers × heads × tokens²)`。因此第一轮不要直接把 `PILOT_LIMIT` 改成 10,000。先确认 64 条的运行时间、显存、磁盘占用、BoolQ 自然错误数量以及错误模式方向，再扩大到 300。`RETAIN_DENSE_ATTENTION=0` 大幅降低 CPU RAM 和磁盘，但以后若要更换 `tau` 或发明新的 dense-attention 统计，需要重新做模型前向；只有明确需要反复离线分析原始 attention 时才设为 `1`。
 
 本轮 `pattern_audit` 是同一无标签 pilot 池上拟合分位数/Mahalanobis、随后才连接标签的 transductive 探索审计，不是 held-out 最终性能。HaluEval 候选还可能带有人工生成风格/长度捷径；BoolQ 错误首先是阅读理解错误，不能未经案例分析直接称为事实幻觉。正式结论必须另设 reference/calibration split，并冻结层、阈值和特征后再评估。

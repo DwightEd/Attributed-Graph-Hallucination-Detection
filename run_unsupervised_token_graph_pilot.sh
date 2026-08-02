@@ -14,6 +14,9 @@ MAX_ATTENTION_GIB="${MAX_ATTENTION_GIB:-12}"
 RUN_TRAINING="${RUN_TRAINING:-0}"
 DEVICE="${DEVICE:-cuda:0}"
 DTYPE="${DTYPE:-float16}"
+POSTPROCESS_DEVICE="${POSTPROCESS_DEVICE:-auto}"
+RETAIN_DENSE_ATTENTION="${RETAIN_DENSE_ATTENTION:-0}"
+CPU_THREADS="${CPU_THREADS:-4}"
 
 PREPARED_DIR="${RUN_DIR}/prepared"
 EXTRACTION_DIR="${RUN_DIR}/extraction"
@@ -21,6 +24,37 @@ AUDIT_DIR="${RUN_DIR}/pattern_audit"
 TRAINING_DIR="${RUN_DIR}/training"
 
 mkdir -p "${RUN_DIR}"
+
+case "${POSTPROCESS_DEVICE}" in
+  auto|cpu|model) ;;
+  *)
+    echo "POSTPROCESS_DEVICE must be auto, cpu, or model" >&2
+    exit 2
+    ;;
+esac
+case "${RETAIN_DENSE_ATTENTION}" in
+  0|1) ;;
+  *)
+    echo "RETAIN_DENSE_ATTENTION must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+if [[ ! "${CPU_THREADS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "CPU_THREADS must be a positive integer" >&2
+  exit 2
+fi
+
+export OMP_NUM_THREADS="${CPU_THREADS}"
+export MKL_NUM_THREADS="${CPU_THREADS}"
+export OPENBLAS_NUM_THREADS="${CPU_THREADS}"
+export NUMEXPR_NUM_THREADS="${CPU_THREADS}"
+export BLIS_NUM_THREADS="${CPU_THREADS}"
+export TOKENIZERS_PARALLELISM=false
+
+EXTRACTION_STORAGE_ARGS=()
+if [[ "${RETAIN_DENSE_ATTENTION}" == "0" ]]; then
+  EXTRACTION_STORAGE_ARGS+=(--discard-dense-attention)
+fi
 
 if [[ "${DATASET}" == "halueval_qa" ]]; then
   "${PYTHON_BIN}" -m unsupervised_token_graph.prepare \
@@ -56,7 +90,9 @@ fi
   --max-attention-gib "${MAX_ATTENTION_GIB}" \
   --limit "${PILOT_LIMIT}" \
   --device "${DEVICE}" \
-  --dtype "${DTYPE}"
+  --dtype "${DTYPE}" \
+  --postprocess-device "${POSTPROCESS_DEVICE}" \
+  "${EXTRACTION_STORAGE_ARGS[@]}"
 
 "${PYTHON_BIN}" -m unsupervised_token_graph.audit \
   --features "${EXTRACTION_DIR}/features.jsonl" \

@@ -18,14 +18,98 @@ from .identity import model_source_signature
 from .trace import assign_segment_ids
 
 
+_POSTPROCESS_CHOICES = ("auto", "cpu", "model")
+_POSTPROCESS_WORKSPACE_MULTIPLIER = 4
+_POSTPROCESS_CUDA_RESERVE_BYTES = 2 * 1024**3
+
+
 def _estimate_attention_storage_bytes(
     num_layers: int,
     num_heads: int,
     token_count: int,
 ) -> int:
-    """Estimate the float32 CPU attention tensor retained by this extractor."""
+    """Conservatively estimate a dense float32 attention representation."""
 
     return int(num_layers) * int(num_heads) * int(token_count) ** 2 * 4
+
+
+def _attention_tensor_bytes(attentions: Sequence[torch.Tensor]) -> int:
+    return sum(
+        int(value[0].numel()) * int(value[0].element_size())
+        for value in attentions
+    )
+
+
+def _stack_batch_zero_on_device(
+    values: Sequence[torch.Tensor],
+    device: torch.device,
+) -> torch.Tensor:
+    """Stack batch-zero views without retaining a second CPU list copy."""
+
+    if not values:
+        raise ValueError("cannot stack an empty tensor sequence")
+    first = values[0][0].detach()
+    stacked = torch.empty(
+        (len(values), *first.shape),
+        dtype=first.dtype,
+        device=device,
+    )
+    for index, value in enumerate(values):
+        stacked[index].copy_(value[0].detach().to(device))
+    return stacked
+
+
+def _move_postprocess_tensors(
+    trace: dict[str, object],
+    device: torch.device | str,
+) -> None:
+    for name in (
+        "attention",
+        "hidden_states",
+        "token_log_prob",
+        "next_token_entropy",
+        "token_stat_valid",
+    ):
+        trace[name] = torch.as_tensor(trace[name]).detach().to(device)
+    trace["postprocess_device"] = str(torch.device(device))
+
+
+def _resolve_postprocess_device(
+    policy: str,
+    model_device: torch.device | str,
+    *,
+    attention_bytes: int,
+    cuda_free_bytes: int | None = None,
+    reserve_bytes: int = _POSTPROCESS_CUDA_RESERVE_BYTES,
+) -> torch.device:
+    """Choose GPU postprocessing only when a conservative workspace fits."""
+
+    if policy not in _POSTPROCESS_CHOICES:
+        raise ValueError(
+            f"postprocess_device must be one of {_POSTPROCESS_CHOICES}, got {policy!r}"
+        )
+    device = torch.device(model_device)
+    if policy == "cpu" or device.type != "cuda":
+        return torch.device("cpu")
+    if policy == "model":
+        return device
+    if cuda_free_bytes is None:
+        try:
+            cuda_free_bytes, _ = torch.cuda.mem_get_info(device)
+            # PyTorch can reuse free blocks held by its allocator even though
+            # the CUDA driver does not report them as globally free.
+            cuda_free_bytes += max(
+                int(torch.cuda.memory_reserved(device))
+                - int(torch.cuda.memory_allocated(device)),
+                0,
+            )
+        except (AssertionError, RuntimeError, TypeError, ValueError):
+            return torch.device("cpu")
+    required = (
+        int(attention_bytes) * _POSTPROCESS_WORKSPACE_MULTIPLIER
+        + int(reserve_bytes)
+    )
+    return device if int(cuda_free_bytes) >= required else torch.device("cpu")
 
 
 def _unbatch(value):
@@ -168,6 +252,7 @@ def extract_example_trace(
     selected_hidden_layers: Sequence[int],
     max_tokens: int | None = None,
     max_attention_bytes: int | None = None,
+    postprocess_device: str = "auto",
 ) -> dict[str, object]:
     """Run one teacher-forced forward pass and return a label-free trace."""
 
@@ -181,8 +266,8 @@ def extract_example_trace(
         )
         if estimated > max_attention_bytes:
             raise MemoryError(
-                f"example {example.example_id!r} would retain approximately "
-                f"{estimated / 1024**3:.2f} GiB of float32 attention; limit is "
+                f"example {example.example_id!r} has a conservative dense-attention "
+                f"estimate of {estimated / 1024**3:.2f} GiB; limit is "
                 f"{max_attention_bytes / 1024**3:.2f} GiB"
             )
     try:
@@ -193,7 +278,7 @@ def extract_example_trace(
         "input_ids": encoded["input_ids"].unsqueeze(0).to(device),
         "attention_mask": encoded["attention_mask"].unsqueeze(0).to(device),
     }
-    with torch.no_grad():
+    with torch.inference_mode():
         outputs = model(
             **model_inputs,
             output_attentions=True,
@@ -205,9 +290,6 @@ def extract_example_trace(
         raise RuntimeError(
             "The model did not return attention tensors; load it with eager attention"
         )
-    attention = torch.stack(
-        [value[0].detach().cpu().float() for value in outputs.attentions], dim=0
-    )
     if not selected_hidden_layers:
         raise ValueError("at least one hidden-state layer must be selected")
     hidden_count = len(outputs.hidden_states)
@@ -217,15 +299,49 @@ def extract_example_trace(
             f"selected hidden layers {tuple(selected_hidden_layers)} exceed "
             f"the available range for {hidden_count} hidden-state tensors"
         )
-    hidden_states = torch.stack(
-        [outputs.hidden_states[index][0].detach().cpu().float() for index in layer_ids],
-        dim=0,
-    )
-    token_log_prob, entropy, valid = compute_teacher_forced_statistics(
-        outputs.logits, model_inputs["input_ids"]
-    )
-    return {
-        "schema_version": "token_trace_v1",
+    with torch.inference_mode():
+        token_log_prob, entropy, valid = compute_teacher_forced_statistics(
+            outputs.logits, model_inputs["input_ids"]
+        )
+        attention_layers = tuple(outputs.attentions)
+        attention_bytes = _attention_tensor_bytes(attention_layers)
+        processing_device = _resolve_postprocess_device(
+            postprocess_device,
+            device,
+            attention_bytes=attention_bytes,
+        )
+        fallback_reason = None
+        try:
+            attention = _stack_batch_zero_on_device(
+                attention_layers, processing_device
+            )
+            hidden_states = _stack_batch_zero_on_device(
+                tuple(outputs.hidden_states[index] for index in layer_ids),
+                processing_device,
+            )
+        except torch.OutOfMemoryError:
+            if postprocess_device != "auto" or processing_device.type != "cuda":
+                raise
+            if "attention" in locals():
+                del attention
+            if "hidden_states" in locals():
+                del hidden_states
+            torch.cuda.empty_cache()
+            processing_device = torch.device("cpu")
+            fallback_reason = "cuda_oom_during_stack"
+            attention = _stack_batch_zero_on_device(
+                attention_layers, processing_device
+            )
+            hidden_states = _stack_batch_zero_on_device(
+                tuple(outputs.hidden_states[index] for index in layer_ids),
+                processing_device,
+            )
+        token_log_prob = token_log_prob.detach().to(processing_device)
+        entropy = entropy.detach().to(processing_device)
+        valid = valid.detach().to(processing_device)
+    del outputs, attention_layers
+    trace = {
+        "schema_version": "token_trace_v2",
         "example_id": example.example_id,
         "pair_id": example.pair_id,
         "dataset": example.dataset,
@@ -239,10 +355,15 @@ def extract_example_trace(
         "attention": attention,
         "selected_hidden_layers": torch.tensor(layer_ids, dtype=torch.long),
         "hidden_states": hidden_states,
-        "token_log_prob": token_log_prob.detach().cpu(),
-        "next_token_entropy": entropy.detach().cpu(),
-        "token_stat_valid": valid.detach().cpu(),
+        "token_log_prob": token_log_prob,
+        "next_token_entropy": entropy,
+        "token_stat_valid": valid,
+        "postprocess_device": str(processing_device),
+        "dense_attention_bytes": attention_bytes,
     }
+    if fallback_reason is not None:
+        trace["postprocess_fallback_reason"] = fallback_reason
+    return trace
 
 
 def _token_spans(segment_ids: torch.Tensor) -> dict[str, tuple[int, int]]:
@@ -256,10 +377,16 @@ def _token_spans(segment_ids: torch.Tensor) -> dict[str, tuple[int, int]]:
 
 
 def _scalar(value) -> float:
+    if isinstance(value, torch.Tensor):
+        return float(value.detach().to(torch.float32).mean().item())
     return float(np.asarray(value, dtype=float).mean())
 
 
-def summarize_trace_record(trace: dict[str, object]) -> dict[str, object]:
+def summarize_trace_record(
+    trace: dict[str, object],
+    *,
+    edge_presence=None,
+) -> dict[str, object]:
     """Convert a raw trace to scalar observables before labels are available."""
 
     segment_ids = torch.as_tensor(trace["segment_ids"], dtype=torch.long)
@@ -267,6 +394,7 @@ def summarize_trace_record(trace: dict[str, object]) -> dict[str, object]:
         trace["attention"],
         _token_spans(segment_ids),
         edge_threshold=float(trace.get("edge_threshold", 0.05)),
+        edge_presence=edge_presence,
     )
     record: dict[str, object] = {
         "example_id": str(trace["example_id"]),
@@ -277,28 +405,81 @@ def summarize_trace_record(trace: dict[str, object]) -> dict[str, object]:
         "question_token_count": int((segment_ids == 2).sum()),
         "answer_token_count": int((segment_ids == 3).sum()),
     }
+    tensor_names = []
+    tensor_scalars = []
     for name, value in summary.items():
-        record[name] = _scalar(value)
+        if isinstance(value, torch.Tensor):
+            tensor_names.append(name)
+            tensor_scalars.append(value.detach().to(torch.float32).mean())
+        else:
+            record[name] = _scalar(value)
+    if tensor_scalars:
+        # One device synchronization for all attention features, rather than
+        # one .item() call per feature.
+        scalar_values = torch.stack(tensor_scalars).cpu().tolist()
+        record.update(zip(tensor_names, (float(value) for value in scalar_values)))
     answer_mask = segment_ids == 3
     if "token_log_prob" in trace:
+        values = torch.as_tensor(trace["token_log_prob"]).detach().to(torch.float32)
         valid = torch.as_tensor(
             trace.get("token_stat_valid", torch.ones_like(answer_mask)),
             dtype=torch.bool,
-        )
-        selected = answer_mask & valid
+            device=values.device,
+        ).detach()
+        selected = answer_mask.to(values.device) & valid
         if bool(selected.any()):
-            values = torch.as_tensor(trace["token_log_prob"], dtype=torch.float32)
-            record["mean_answer_log_prob"] = float(values[selected].mean())
+            record["mean_answer_log_prob"] = float(values[selected].mean().item())
     if "next_token_entropy" in trace:
+        values = torch.as_tensor(trace["next_token_entropy"]).detach().to(
+            torch.float32
+        )
         valid = torch.as_tensor(
             trace.get("token_stat_valid", torch.ones_like(answer_mask)),
             dtype=torch.bool,
-        )
-        selected = answer_mask & valid
+            device=values.device,
+        ).detach()
+        selected = answer_mask.to(values.device) & valid
         if bool(selected.any()):
-            values = torch.as_tensor(trace["next_token_entropy"], dtype=torch.float32)
-            record["mean_answer_next_token_entropy"] = float(values[selected].mean())
+            record["mean_answer_next_token_entropy"] = float(
+                values[selected].mean().item()
+            )
     return record
+
+
+def _build_graph_and_feature_record(
+    trace: dict[str, object],
+    *,
+    tau: float,
+    include_prefix_edges: bool,
+    include_hidden_nodes: bool,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Share the expensive all-layer max and release summary temporaries first."""
+
+    with torch.inference_mode():
+        edge_presence = (
+            torch.as_tensor(trace["attention"])
+            .amax(dim=(0, 1))
+            .to(torch.float32)
+            > float(tau)
+        )
+        # Finish scalar reductions before allocating edge_attr, whose dense
+        # worst case can be several GiB.
+        feature_record = summarize_trace_record(
+            trace, edge_presence=edge_presence
+        )
+        graph = build_token_graph(
+            trace["input_ids"],
+            trace["attention"],
+            trace["segment_ids"],
+            hidden_states=(trace["hidden_states"] if include_hidden_nodes else None),
+            token_log_probs=trace["token_log_prob"],
+            next_token_entropy=trace["next_token_entropy"],
+            token_stat_valid=trace["token_stat_valid"],
+            edge_presence=edge_presence,
+            tau=tau,
+            include_prefix_edges=include_prefix_edges,
+        )
+    return graph, feature_record
 
 
 def resolve_probe_layers(num_hidden_layers: int, num_probes: int = 6) -> tuple[int, ...]:
@@ -322,10 +503,13 @@ def _fingerprint(
     max_tokens: int | None = None,
     model_signature: str | None = None,
     extraction_dtype: str = "unknown",
+    postprocess_device: str = "auto",
+    retain_dense_attention: bool = True,
+    trace_storage_dtype: str = "float16",
 ) -> str:
     payload = json.dumps(
         {
-            "schema": "token_trace_graph_v3",
+            "schema": "token_trace_graph_v4",
             "text": example.text,
             "model_id": model_id,
             "model_signature": model_signature or model_id,
@@ -335,6 +519,9 @@ def _fingerprint(
             "include_hidden_nodes": include_hidden_nodes,
             "max_tokens": max_tokens,
             "extraction_dtype": extraction_dtype,
+            "postprocess_device": postprocess_device,
+            "retain_dense_attention": retain_dense_attention,
+            "trace_storage_dtype": trace_storage_dtype,
             "exact_replay": {
                 name: example.metadata.get(name)
                 for name in (
@@ -357,6 +544,41 @@ def _atomic_torch_save(value, path: Path) -> None:
     temporary_path = path.with_suffix(path.suffix + ".tmp")
     torch.save(value, temporary_path)
     temporary_path.replace(path)
+
+
+def _to_cpu_tree(value):
+    """Detach every tensor leaf so cached artifacts are device-portable."""
+
+    if isinstance(value, torch.Tensor):
+        return value.detach().to("cpu")
+    if isinstance(value, dict):
+        return {key: _to_cpu_tree(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_to_cpu_tree(child) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_to_cpu_tree(child) for child in value)
+    return value
+
+
+def _stored_trace(
+    trace: dict[str, object],
+    *,
+    retain_dense_attention: bool,
+) -> dict[str, object]:
+    attention = torch.as_tensor(trace["attention"]).detach()
+    stored = {
+        key: value for key, value in trace.items() if key != "attention"
+    }
+    stored["attention_shape"] = list(attention.shape)
+    stored["hidden_states"] = torch.as_tensor(trace["hidden_states"]).detach().to(
+        device="cpu", dtype=torch.float16
+    )
+    if retain_dense_attention:
+        stored["attention"] = attention.to(device="cpu", dtype=torch.float16)
+        stored["attention_storage"] = "float16_cpu"
+    else:
+        stored["attention_storage"] = "discarded_after_postprocessing"
+    return _to_cpu_tree(stored)
 
 
 def _artifact_path(directory: Path, example_id: str) -> Path:
@@ -382,6 +604,8 @@ def extract_prepared_dataset(
     model_signature: str | None = None,
     max_attention_bytes: int | None = None,
     extraction_dtype: str = "unknown",
+    postprocess_device: str = "auto",
+    retain_dense_attention: bool = True,
 ) -> dict[str, object]:
     """Extract traces, token graphs, and scalar pattern features without labels."""
 
@@ -391,7 +615,13 @@ def extract_prepared_dataset(
     trace_directory.mkdir(parents=True, exist_ok=True)
     graph_directory.mkdir(parents=True, exist_ok=True)
     feature_records = []
+    postprocess_device_counts: dict[str, int] = {}
+    postprocess_fallback_counts: dict[str, int] = {}
+    extracted_examples = 0
+    reused_examples = 0
+    gpu_peak_allocated_bytes_max = 0
     for position, example in enumerate(examples, start=1):
+        stored_trace = None
         trace_path = _artifact_path(trace_directory, example.example_id)
         graph_path = _artifact_path(graph_directory, example.example_id)
         fingerprint = _fingerprint(
@@ -404,6 +634,8 @@ def extract_prepared_dataset(
             max_tokens=max_tokens,
             model_signature=model_signature,
             extraction_dtype=extraction_dtype,
+            postprocess_device=postprocess_device,
+            retain_dense_attention=retain_dense_attention,
         )
         if trace_path.exists() and graph_path.exists() and not overwrite:
             trace = torch.load(trace_path, map_location="cpu", weights_only=True)
@@ -416,7 +648,13 @@ def extract_prepared_dataset(
                     f"Cached example {example.example_id!r} exceeds max_tokens="
                     f"{max_tokens}; use --overwrite only after changing the input"
                 )
-            attention_shape = torch.as_tensor(trace["attention"]).shape
+            attention_shape = trace.get("attention_shape")
+            if attention_shape is None and "attention" in trace:
+                attention_shape = list(torch.as_tensor(trace["attention"]).shape)
+            if attention_shape is None or len(attention_shape) != 4:
+                raise RuntimeError(
+                    f"Cached example {example.example_id!r} has no valid attention shape"
+                )
             estimated = _estimate_attention_storage_bytes(
                 attention_shape[0], attention_shape[1], attention_shape[-1]
             )
@@ -439,7 +677,20 @@ def extract_prepared_dataset(
                     f"Stale or mismatched trace cache for {example.example_id}; "
                     "use --overwrite"
                 )
+            if not isinstance(trace.get("feature_record"), dict):
+                raise RuntimeError(
+                    f"Cached example {example.example_id!r} has no feature record; "
+                    "use --overwrite"
+                )
+            feature_record = trace["feature_record"]
+            reused_examples += 1
         else:
+            try:
+                model_device = next(model.parameters()).device
+            except (StopIteration, AttributeError):
+                model_device = torch.device("cpu")
+            if model_device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(model_device)
             trace = extract_example_trace(
                 model,
                 tokenizer,
@@ -447,22 +698,42 @@ def extract_prepared_dataset(
                 selected_hidden_layers=selected_hidden_layers,
                 max_tokens=max_tokens,
                 max_attention_bytes=max_attention_bytes,
+                postprocess_device=postprocess_device,
             )
             trace["extractor_model_id"] = model_id
             trace["extraction_fingerprint"] = fingerprint
             trace["extraction_dtype"] = extraction_dtype
             trace["edge_threshold"] = float(tau)
-            graph = build_token_graph(
-                trace["input_ids"],
-                trace["attention"],
-                trace["segment_ids"],
-                hidden_states=(trace["hidden_states"] if include_hidden_nodes else None),
-                token_log_probs=trace["token_log_prob"],
-                next_token_entropy=trace["next_token_entropy"],
-                token_stat_valid=trace["token_stat_valid"],
-                tau=tau,
-                include_prefix_edges=include_prefix_edges,
-            )
+            trace["postprocess_device_policy"] = postprocess_device
+            trace["retain_dense_attention"] = bool(retain_dense_attention)
+            try:
+                graph, feature_record = _build_graph_and_feature_record(
+                    trace,
+                    tau=tau,
+                    include_prefix_edges=include_prefix_edges,
+                    include_hidden_nodes=include_hidden_nodes,
+                )
+            except torch.OutOfMemoryError:
+                attention_device = torch.as_tensor(trace["attention"]).device
+                if postprocess_device != "auto" or attention_device.type != "cuda":
+                    raise
+                torch.cuda.empty_cache()
+                _move_postprocess_tensors(trace, "cpu")
+                torch.cuda.empty_cache()
+                trace["postprocess_fallback_reason"] = (
+                    "cuda_oom_during_graph_or_features"
+                )
+                graph, feature_record = _build_graph_and_feature_record(
+                    trace,
+                    tau=tau,
+                    include_prefix_edges=include_prefix_edges,
+                    include_hidden_nodes=include_hidden_nodes,
+                )
+            trace["feature_record"] = feature_record
+            if model_device.type == "cuda":
+                trace["gpu_peak_allocated_bytes"] = int(
+                    torch.cuda.max_memory_allocated(model_device)
+                )
             graph.update(
                 {
                     "example_id": example.example_id,
@@ -472,18 +743,44 @@ def extract_prepared_dataset(
                     "extraction_fingerprint": fingerprint,
                 }
             )
-            stored_trace = dict(trace)
-            stored_trace["attention"] = trace["attention"].half()
-            stored_trace["hidden_states"] = trace["hidden_states"].half()
+            stored_trace = _stored_trace(
+                trace,
+                retain_dense_attention=retain_dense_attention,
+            )
+            graph = _to_cpu_tree(graph)
             _atomic_torch_save(stored_trace, trace_path)
             _atomic_torch_save(graph, graph_path)
-            # Summaries must use the exact persisted representation. Otherwise a
-            # resumed run would summarize float16 cache values while the first
-            # run summarized transient float32 tensors.
-            trace = stored_trace
-        feature_records.append(summarize_trace_record(trace))
+            extracted_examples += 1
+        feature_records.append(feature_record)
+        resolved_device = str(trace.get("postprocess_device", "unknown"))
+        postprocess_device_counts[resolved_device] = (
+            postprocess_device_counts.get(resolved_device, 0) + 1
+        )
+        fallback_reason = trace.get("postprocess_fallback_reason")
+        if fallback_reason:
+            reason = str(fallback_reason)
+            postprocess_fallback_counts[reason] = (
+                postprocess_fallback_counts.get(reason, 0) + 1
+            )
+        gpu_peak_allocated_bytes_max = max(
+            gpu_peak_allocated_bytes_max,
+            int(trace.get("gpu_peak_allocated_bytes", 0)),
+        )
         if position == 1 or position % 25 == 0 or position == len(examples):
-            print(f"Extracted {position}/{len(examples)} token graphs")
+            peak_suffix = (
+                f"; max_cuda_allocated_gib="
+                f"{gpu_peak_allocated_bytes_max / 1024**3:.2f}"
+                if gpu_peak_allocated_bytes_max
+                else ""
+            )
+            print(
+                f"Extracted {position}/{len(examples)} token graphs; "
+                f"postprocess={resolved_device}{peak_suffix}"
+            )
+        # Release a live GPU trace before the next model forward. Assignment on
+        # the next iteration would otherwise keep it alive while evaluating the
+        # right-hand side of extract_example_trace().
+        del trace, graph, stored_trace
 
     feature_path = output_directory / "features.jsonl"
     feature_path.write_text(
@@ -506,6 +803,16 @@ def extract_prepared_dataset(
         "include_hidden_nodes": include_hidden_nodes,
         "max_attention_bytes": max_attention_bytes,
         "extraction_dtype": extraction_dtype,
+        "postprocess_device_policy": postprocess_device,
+        "postprocess_device_counts": postprocess_device_counts,
+        "postprocess_fallback_counts": postprocess_fallback_counts,
+        "retain_dense_attention": retain_dense_attention,
+        "trace_storage_dtype": "float16",
+        "postprocessing_schema": "token_trace_graph_v4",
+        "feature_reduction_dtype": "float32",
+        "extracted_examples": extracted_examples,
+        "reused_examples": reused_examples,
+        "gpu_peak_allocated_bytes_max": gpu_peak_allocated_bytes_max,
         "trace_dir": str(trace_directory),
         "graph_dir": str(graph_directory),
         "graph_files": [
@@ -532,7 +839,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-attention-gib",
         type=float,
         default=12.0,
-        help="Refuse a sample whose retained float32 attention exceeds this estimate",
+        help="Refuse a sample whose conservative dense-attention estimate exceeds this",
     )
     parser.add_argument("--probe-layers", help="Comma-separated hidden-state indices")
     parser.add_argument("--tau", type=float, default=0.05)
@@ -541,6 +848,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--postprocess-device",
+        choices=_POSTPROCESS_CHOICES,
+        default="auto",
+        help=(
+            "Where graph/features run: auto uses the model GPU only with "
+            "conservative free-memory headroom"
+        ),
+    )
+    parser.add_argument(
+        "--discard-dense-attention",
+        action="store_true",
+        help=(
+            "Keep graph, hidden states, and scalar features but omit the raw dense "
+            "attention tensor from each trace"
+        ),
+    )
     parser.add_argument(
         "--dtype", choices=("float16", "bfloat16", "float32"), default="float16"
     )
@@ -582,6 +906,8 @@ def main(argv: list[str] | None = None) -> int:
         model_signature=source_signature,
         max_attention_bytes=int(args.max_attention_gib * 1024**3),
         extraction_dtype=args.dtype,
+        postprocess_device=args.postprocess_device,
+        retain_dense_attention=not args.discard_dense_attention,
     )
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
     return 0

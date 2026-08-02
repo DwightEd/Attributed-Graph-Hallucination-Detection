@@ -38,6 +38,9 @@ class FeaturePilotShellContractTests(unittest.TestCase):
         self.assertIn("flock -n", script)
         self.assertIn("PYTHONUNBUFFERED=1", script)
         self.assertIn("OFFLINE_ONLY=1", script)
+        self.assertIn('POSTPROCESS_DEVICE="${POSTPROCESS_DEVICE:-auto}"', script)
+        self.assertIn('RETAIN_DENSE_ATTENTION="${RETAIN_DENSE_ATTENTION:-0}"', script)
+        self.assertIn('OMP_NUM_THREADS="${CPU_THREADS}"', script)
 
     def test_dataset_pilot_forwards_device_and_dtype_to_both_model_loads(self):
         script = (
@@ -46,6 +49,15 @@ class FeaturePilotShellContractTests(unittest.TestCase):
 
         self.assertGreaterEqual(script.count('--device "${DEVICE}"'), 2)
         self.assertGreaterEqual(script.count('--dtype "${DTYPE}"'), 2)
+        self.assertIn('--postprocess-device "${POSTPROCESS_DEVICE}"', script)
+        self.assertIn("--discard-dense-attention", script)
+        self.assertIn(
+            'if [[ "${RETAIN_DENSE_ATTENTION}" == "0" ]]', script
+        )
+        self.assertIn(
+            'EXTRACTION_STORAGE_ARGS+=(--discard-dense-attention)', script
+        )
+        self.assertIn('"${EXTRACTION_STORAGE_ARGS[@]}"', script)
 
 
 if __name__ == "__main__":

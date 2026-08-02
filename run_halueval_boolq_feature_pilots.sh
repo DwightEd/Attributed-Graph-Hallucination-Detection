@@ -9,13 +9,16 @@ MODEL_PATH="${MODEL_PATH:-/share/home/tm902089733300000/a903202310/lys/models/Me
 GPU_ID="${GPU_ID:-0}"
 DEVICE="cuda:0"
 DTYPE="${DTYPE:-float16}"
+POSTPROCESS_DEVICE="${POSTPROCESS_DEVICE:-auto}"
+RETAIN_DENSE_ATTENTION="${RETAIN_DENSE_ATTENTION:-0}"
+CPU_THREADS="${CPU_THREADS:-4}"
 PILOT_LIMIT="${PILOT_LIMIT:-64}"
 MAX_TOKENS="${MAX_TOKENS:-1024}"
 MAX_ATTENTION_GIB="${MAX_ATTENTION_GIB:-6}"
 GPU_BUSY_LIMIT_MIB="${GPU_BUSY_LIMIT_MIB:-512}"
 ALLOW_BUSY_GPU="${ALLOW_BUSY_GPU:-0}"
 DOWNLOAD_DATA="${DOWNLOAD_DATA:-1}"
-RUN_ROOT="${RUN_ROOT:-${DATA_ROOT}/feature_extraction/token_graph_pilot_v3_${PILOT_LIMIT}}"
+RUN_ROOT="${RUN_ROOT:-${DATA_ROOT}/feature_extraction/token_graph_pilot_v4_gpu_${PILOT_LIMIT}}"
 
 case "${DTYPE}" in
   float16|bfloat16|float32) ;;
@@ -24,6 +27,21 @@ case "${DTYPE}" in
     exit 2
     ;;
 esac
+case "${POSTPROCESS_DEVICE}" in
+  auto|cpu|model) ;;
+  *)
+    echo "POSTPROCESS_DEVICE must be auto, cpu, or model" >&2
+    exit 2
+    ;;
+esac
+if [[ "${RETAIN_DENSE_ATTENTION}" != "0" && "${RETAIN_DENSE_ATTENTION}" != "1" ]]; then
+  echo "RETAIN_DENSE_ATTENTION must be 0 or 1" >&2
+  exit 2
+fi
+if [[ ! "${CPU_THREADS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "CPU_THREADS must be a positive integer" >&2
+  exit 2
+fi
 
 if [[ ! -d "${MODEL_PATH}" ]]; then
   echo "Model directory does not exist: ${MODEL_PATH}" >&2
@@ -85,6 +103,11 @@ export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 export DTYPE
+export OMP_NUM_THREADS="${CPU_THREADS}"
+export MKL_NUM_THREADS="${CPU_THREADS}"
+export OPENBLAS_NUM_THREADS="${CPU_THREADS}"
+export NUMEXPR_NUM_THREADS="${CPU_THREADS}"
+export BLIS_NUM_THREADS="${CPU_THREADS}"
 
 "${PYTHON_BIN}" - <<'PY'
 import json
@@ -126,6 +149,8 @@ run_dataset() {
     MAX_ATTENTION_GIB="${MAX_ATTENTION_GIB}" \
     DEVICE="${DEVICE}" \
     DTYPE="${DTYPE}" \
+    POSTPROCESS_DEVICE="${POSTPROCESS_DEVICE}" \
+    RETAIN_DENSE_ATTENTION="${RETAIN_DENSE_ATTENTION}" \
     RUN_TRAINING=0 \
     bash "${SCRIPT_DIR}/run_unsupervised_token_graph_pilot.sh"
   echo "Completed ${dataset_name}: ${dataset_run_dir}/pattern_audit/pattern_audit.md"
