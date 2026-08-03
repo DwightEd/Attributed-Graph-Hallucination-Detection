@@ -9,7 +9,7 @@
 
 ## 方法实际在测试什么
 
-每个 token 的节点属性由 attention 路由统计组成：对角质量、prefix 质量、回答历史质量、归一化熵、最大集中度和严格因果质量。每条 top-k 边保存跨层/跨头的均值、最大值、方差、早层/晚层质量、层/头分歧及相对 token 距离。
+每个 token 的节点属性由 attention 路由统计组成：对角质量、prefix 质量、回答历史质量、归一化熵、最大集中度和严格因果质量。每条 top-k 边保存跨层/跨头均值、最大值、标准差、前半/后半层质量及相对 token 距离。正式 CSR 还记录通道覆盖率和层覆盖率（阈值保留后该边出现的比例）；只有 legacy dense cache 的后两维才是层间/头间分歧。
 
 类型化 masked autoencoder 随机遮住回答 token，并同时重建：
 
@@ -23,7 +23,7 @@
 
 ## 工程结构
 
-- `unsupervised_token_graph/ragtruth_graph.py`：legacy cache 白名单读取、GPU 分块、严格因果 top-k 图及自监督目标；
+- `unsupervised_token_graph/ragtruth_graph.py`：正式 sparse-CSR / legacy dense cache 白名单读取、GPU 分块、严格因果 top-k 图及自监督目标；
 - `unsupervised_token_graph/typed_model.py`：类型化消息传递、masked autoencoder、稳健损失和 token 分数；
 - `unsupervised_token_graph/ragtruth_data.py`：紧凑缓存、source-group split、GPU graph store 与 batching；
 - `unsupervised_token_graph/typed_experiment.py`：训练、无标签校准和逐 token 打分；
@@ -36,13 +36,15 @@
 
 ## 内存与速度
 
-原始 `attention[L,H,N,N]` 以 CPU mmap 打开，不复制整个 corpus，也不在 CPU 构造稠密邻接。构图时只把
+正式数据是 response query 的阈值保留 CSR。代码先以 CPU mmap 校验其 schema、原始 dtype、fingerprint、截断策略和 CSR 边界，再把 `row_ptr / columns / values / diagonal` 数组一次搬到 GPU，随后按 `query_block` 处理；整个路径从不构造 `N x N` attention 或邻接矩阵。阈值以下质量不可恢复，因此正式图的节点/边统计明确解释为 retained-attention lower bound。
+
+只有 legacy 数据包含原始 `attention[L,H,N,N]`。它同样以 CPU mmap 打开，不复制整个 corpus；构图时只把
 
 ```text
 [layer_chunk, heads, query_block, tokens]
 ```
 
-的 tile 搬到 GPU。最终边数至多约为
+的 layer/query tile 搬到 GPU。两种格式的最终边数都至多约为
 
 ```text
 response_tokens * (prefix_top_k + history_top_k)
@@ -99,7 +101,7 @@ RUN_EVALUATION=1 bash run_ragtruth_typed_token_graph.sh
 RESIDENCY=stream bash run_ragtruth_typed_token_graph.sh
 ```
 
-GPU tile 峰值过高时，降低 `QUERY_BLOCK` 或 `LAYER_CHUNK`；两者只影响速度/峰值内存，不改变数学结果：
+正式 CSR 的临时向量峰值过高时降低 `QUERY_BLOCK`；legacy tile 峰值过高时还可降低 `LAYER_CHUNK`。两者只影响速度/峰值内存，不改变数学结果：
 
 ```bash
 QUERY_BLOCK=32 LAYER_CHUNK=1 bash run_ragtruth_typed_token_graph.sh
@@ -127,7 +129,7 @@ outputs/ragtruth_typed_token_graph/fresh_attention_c8847872bedf/
 
 仓库中的旧 `get_attention.py` 一处 span 映射使用了 `add_special_tokens=False` 的 prefix 长度，而 `response_idx` 来自可能包含 BOS 的完整 tokenizer 调用。不同 tokenizer/cache 可能因此出现一位偏移。
 
-默认 `LABEL_SHIFT=0`，代码不会猜测或自动修正。如果审计确认该次 cache 的标签确实左移一位，才显式运行：
+正式 sparse-CSR cache 的 `y_token` 是全局 token 坐标，`LABEL_SHIFT` **必须为 0**；非零值会直接报错。只有 legacy cache 才允许在人工审计确认标签确实左移一位后显式运行：
 
 ```bash
 LABEL_SHIFT=1 bash run_ragtruth_typed_token_graph.sh

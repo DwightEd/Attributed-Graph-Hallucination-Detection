@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 import json
 import math
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -14,17 +14,40 @@ from .ragtruth_data import atomic_json, discover_attention_paths, load_compact_m
 from .ragtruth_graph import load_attention_sample
 
 
+def _binary_label(value: object, context: str) -> int:
+    try:
+        tensor = torch.as_tensor(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{context} must be a finite binary label in {{0, 1}}") from error
+    if tensor.numel() != 1 or tensor.is_complex():
+        raise ValueError(f"{context} must be a finite binary label in {{0, 1}}")
+    if tensor.is_floating_point() and not bool(torch.isfinite(tensor).item()):
+        raise ValueError(f"{context} must be a finite binary label in {{0, 1}}")
+    if not bool(((tensor == 0) | (tensor == 1)).item()):
+        raise ValueError(f"{context} must be a finite binary label in {{0, 1}}")
+    return int(tensor.item())
+
+
+def _binary_label_tensor(value: object, context: str) -> torch.Tensor:
+    raw = torch.as_tensor(value).flatten()
+    if raw.is_complex() or (
+        raw.is_floating_point() and not bool(torch.isfinite(raw).all())
+    ) or bool((~((raw == 0) | (raw == 1))).any()):
+        raise ValueError(f"{context} must contain only finite binary labels in {{0, 1}}")
+    return raw.long()
+
+
 def evaluate_token_score_records(
     score_records: Sequence[Mapping[str, object]],
-    token_labels: Mapping[tuple[str, int, int], int],
+    token_labels: Mapping[tuple[str, str, int], int],
 ) -> dict[str, float | int]:
     """Join frozen scores to external labels by exact token identity."""
 
     if not score_records:
         raise ValueError("score records are empty")
-    score_by_key: dict[tuple[str, int, int], float] = {}
+    score_by_key: dict[tuple[str, str, int], float] = {}
     for record in score_records:
-        key = (str(record["source_id"]), int(record["original_idx"]), int(record["token_idx"]))
+        key = (str(record["source_id"]), str(record["sample_id"]), int(record["token_idx"]))
         if key in score_by_key:
             raise ValueError(f"duplicate score token identity: {key}")
         score_by_key[key] = float(record["score"])
@@ -33,7 +56,10 @@ def evaluate_token_score_records(
         raise ValueError(f"score/label token alignment failed: missing={len(score_keys - label_keys)}, "
                          f"extra={len(label_keys - score_keys)}")
     ordered = sorted(score_keys)
-    labels = np.asarray([int(token_labels[key]) for key in ordered], dtype=np.int8)
+    labels = np.asarray(
+        [_binary_label(token_labels[key], f"token label {key}") for key in ordered],
+        dtype=np.int8,
+    )
     scores = np.asarray([score_by_key[key] for key in ordered], dtype=np.float64)
     if set(labels.tolist()) != {0, 1}:
         raise ValueError("both negative and positive token labels are required")
@@ -42,7 +68,7 @@ def evaluate_token_score_records(
     from sklearn.metrics import average_precision_score, roc_auc_score
     prevalence = float(labels.mean())
     auprc = float(average_precision_score(labels, scores))
-    return {"token_count": int(len(labels)), "positive_count": int(labels.sum()),
+    return {"token_count": len(labels), "positive_count": int(labels.sum()),
             "prevalence": prevalence, "auroc": float(roc_auc_score(labels, scores)),
             "auprc": auprc, "auprc_lift": float(auprc / prevalence)}
 
@@ -58,43 +84,106 @@ def read_score_records(path: str | Path) -> list[dict[str, object]]:
 def load_cached_token_labels(
     attention_dir: str | Path, score_records: Sequence[Mapping[str, object]], *,
     label_shift: int = 0, attention_paths: Sequence[Path] | None = None,
-) -> tuple[dict[tuple[str, int, int], int], dict[str, int]]:
-    """Read legacy annotations only at final evaluation time."""
+    expected_provenance: Mapping[tuple[str, str], Mapping[str, object]] | None = None,
+) -> tuple[dict[tuple[str, str, int], int], dict[str, int]]:
+    """Read formal or legacy token annotations only after scores have frozen."""
 
     if not -8 <= label_shift <= 8:
         raise ValueError("label_shift must be between -8 and 8")
-    expected: dict[tuple[str, int], set[int]] = {}
+    expected: dict[tuple[str, str], set[int]] = {}
     for record in score_records:
-        expected.setdefault((str(record["source_id"]), int(record["original_idx"])), set()).add(int(record["token_idx"]))
+        expected.setdefault((str(record["source_id"]), str(record["sample_id"])), set()).add(int(record["token_idx"]))
     paths = list(attention_paths) if attention_paths is not None else discover_attention_paths(attention_dir)
     try:
         from tqdm.auto import tqdm
     except ImportError as error:
         raise RuntimeError("tqdm is required; install requirements-unsupervised-token-graph.txt") from error
-    labels: dict[tuple[str, int, int], int] = {}
-    seen: set[tuple[str, int]] = set()
+    labels: dict[tuple[str, str, int], int] = {}
+    seen: set[tuple[str, str]] = set()
     positive_count = 0
     for path in tqdm(paths, desc="join held-out token labels", unit="sample"):
         sample = load_attention_sample(path, device="cpu", mmap=True, include_labels=True)
-        identity = (str(sample["source_id"]), int(sample["original_idx"]))
+        identity = (str(sample["source_id"]), str(sample["sample_id"]))
         if identity not in expected:
             del sample
             continue
         if identity in seen:
             raise ValueError(f"duplicate attention sample identity: {identity}")
         seen.add(identity)
-        if "hallucination_labels" not in sample:
+        if expected_provenance is not None:
+            expected_raw = expected_provenance.get(identity)
+            if expected_raw is None:
+                raise ValueError(f"compact manifest is missing raw provenance for {identity}")
+            cache_format = str(sample["cache_format"])
+            if cache_format == "formal_sparse_csr":
+                layers = int(sample["num_attention_layers"])
+                heads = int(sample["num_attention_heads"])
+                token_count = int(torch.as_tensor(sample["token_ids"]).numel())
+                cache_dtype = sample["cache_dtype"]
+                fingerprint = sample["attention_cache_fingerprint"]
+                input_policy = sample["input_policy"]
+                was_truncated = sample["was_truncated"]
+                attention_floor = sample["attention_floor"]
+            else:
+                attention = torch.as_tensor(sample["attention"])
+                layers, heads = map(int, attention.shape[:2])
+                token_count = (
+                    int(torch.as_tensor(sample["token_ids"]).numel())
+                    if "token_ids" in sample
+                    else int(attention.shape[-1])
+                )
+                cache_dtype = str(attention.dtype).removeprefix("torch.")
+                fingerprint = input_policy = was_truncated = attention_floor = None
+            observed = {
+                "cache_format": cache_format,
+                "attention_cache_fingerprint": fingerprint,
+                "cache_dtype": cache_dtype,
+                "input_policy": input_policy,
+                "was_truncated": was_truncated,
+                "attention_floor": attention_floor,
+                "response_idx": int(sample["response_idx"]),
+                "token_count": token_count,
+                "layers": layers,
+                "heads": heads,
+            }
+            divergent = [
+                key for key, value in expected_raw.items() if observed.get(key) != value
+            ]
+            if divergent:
+                raise RuntimeError(
+                    f"raw cache provenance diverges for {path}: {', '.join(divergent)}"
+                )
+        cache_format = str(sample.get("cache_format", ""))
+        formal = cache_format == "formal_sparse_csr"
+        if formal and label_shift:
+            raise ValueError("label_shift is unsupported for formal global y_token annotations")
+        if "y_token" in sample:
+            raw = _binary_label_tensor(sample["y_token"], f"cached labels in {path}")
+        elif "hallucination_labels" in sample:
+            raw = _binary_label_tensor(
+                sample["hallucination_labels"], f"cached labels in {path}"
+            )
+        else:
             raise ValueError(f"cached token labels are absent: {path}")
-        raw = torch.as_tensor(sample["hallucination_labels"]).flatten().long()
-        token_count, response_idx = int(torch.as_tensor(sample["attention"]).shape[-1]), int(sample["response_idx"])
-        if len(raw) != token_count or bool(((raw != 0) & (raw != 1)).any()):
+        if formal or "token_ids" in sample:
+            token_count = int(torch.as_tensor(sample["token_ids"]).numel())
+        else:
+            token_count = int(torch.as_tensor(sample["attention"]).shape[-1])
+        response_idx = int(sample["response_idx"])
+        if len(raw) != token_count:
             raise ValueError(f"invalid cached token labels: {path}")
-        effective_positive = torch.nonzero(raw, as_tuple=False).flatten() + label_shift
-        if bool((effective_positive < response_idx).any()):
-            raise ValueError(f"positive labels fall before response_idx in {path}; verify the span/token alignment "
-                             "and pass an explicit --label-shift only if justified")
+        effective_positive = torch.nonzero(raw, as_tuple=False).flatten()
+        if not formal:
+            effective_positive = effective_positive + label_shift
+        if bool(
+            (effective_positive.lt(response_idx) | effective_positive.ge(token_count)).any()
+        ):
+            raise ValueError(
+                f"shifted positive labels fall outside the response token range in {path}; "
+                "verify the span/token alignment and pass an explicit --label-shift only if justified"
+            )
         for token_idx in expected[identity]:
-            source_idx = token_idx - label_shift
+            source_idx = token_idx if formal else token_idx - label_shift
             if not response_idx <= token_idx < token_count or not 0 <= source_idx < len(raw):
                 raise ValueError(f"score token index cannot align to cached labels: sample={identity}, token={token_idx}")
             value = int(raw[source_idx])
@@ -117,29 +206,50 @@ def evaluate_score_file(
     scores = read_score_records(score_path)
     selected_attention_paths = None
     if graph_dir is not None:
-        identities = {(str(record["source_id"]), int(record["original_idx"])) for record in scores}
+        identities = {(str(record["source_id"]), str(record["sample_id"])) for record in scores}
         attention_root = Path(attention_dir).resolve()
-        source_by_identity = {(str(record["source_id"]), int(record["original_idx"])): str(record["source_file"])
-                              for record in load_compact_manifest(graph_dir)}
+        manifest_records = load_compact_manifest(graph_dir)
+        source_by_identity = {
+            (str(record["source_id"]), str(record["sample_id"])): record
+            for record in manifest_records
+        }
+        if len(source_by_identity) != len(manifest_records):
+            raise RuntimeError("compact manifest contains duplicate sample identities")
         if not identities.issubset(source_by_identity):
             raise ValueError("compact manifest is missing scored sample identities")
         selected_attention_paths = []
         for identity in sorted(identities):
-            path = (attention_root / source_by_identity[identity]).resolve()
+            path = (attention_root / str(source_by_identity[identity]["source_file"])).resolve()
             if attention_root not in path.parents or not path.is_file():
                 raise RuntimeError(f"unsafe or missing source attention file: {path}")
             selected_attention_paths.append(path)
-    token_labels, alignment = load_cached_token_labels(attention_dir, scores, label_shift=label_shift,
-                                                        attention_paths=selected_attention_paths)
+    expected_provenance = None
+    if graph_dir is not None:
+        provenance_keys = (
+            "cache_format", "attention_cache_fingerprint", "cache_dtype",
+            "input_policy", "was_truncated", "attention_floor", "response_idx",
+            "token_count", "layers", "heads",
+        )
+        expected_provenance = {
+            identity: {key: source_by_identity[identity][key] for key in provenance_keys}
+            for identity in identities
+        }
+    token_labels, alignment = load_cached_token_labels(
+        attention_dir,
+        scores,
+        label_shift=label_shift,
+        attention_paths=selected_attention_paths,
+        expected_provenance=expected_provenance,
+    )
     overall = evaluate_token_score_records(scores, token_labels)
     components = {}
     for name in ("node_residual", "neighborhood_residual", "route_residual"):
-        component_records = [{"source_id": record["source_id"], "original_idx": record["original_idx"],
+        component_records = [{"source_id": record["source_id"], "sample_id": record["sample_id"],
                               "token_idx": record["token_idx"], "score": record[name]} for record in scores]
         components[name] = evaluate_token_score_records(component_records, token_labels)
-    grouped: dict[tuple[str, int], dict[str, float | int]] = {}
+    grouped: dict[tuple[str, str], dict[str, float | int]] = {}
     for record in scores:
-        key = (str(record["source_id"]), int(record["original_idx"]))
+        key = (str(record["source_id"]), str(record["sample_id"]))
         token_key = (key[0], key[1], int(record["token_idx"]))
         current = grouped.setdefault(key, {"score": -math.inf, "label": 0})
         current["score"] = max(float(current["score"]), float(record["score"]))

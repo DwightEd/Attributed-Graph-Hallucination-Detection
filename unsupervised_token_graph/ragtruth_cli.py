@@ -36,7 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     compact = commands.add_parser(
-        "compact", help="GPU top-k compression of dense legacy attention"
+        "compact",
+        help="GPU top-k graph construction from formal sparse CSR or legacy dense attention",
     )
     compact.add_argument("--attention-dir", required=True)
     compact.add_argument("--output-dir", required=True)

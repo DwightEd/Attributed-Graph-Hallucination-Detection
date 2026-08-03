@@ -2,20 +2,48 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 import json
 import math
-from pathlib import Path
 import random
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 import torch
 
 from .ragtruth_data import (
-    CompactGraphStore, atomic_json, atomic_torch_save, autocast_context,
-    budget_batches, collate_graphs, load_compact_manifest, make_answer_mask,
-    new_generator, split_paths_by_source,
+    CompactGraphStore,
+    atomic_json,
+    atomic_torch_save,
+    autocast_context,
+    budget_batches,
+    collate_graphs,
+    load_compact_manifest,
+    load_graph_semantic_signature,
+    make_answer_mask,
+    new_generator,
+    split_paths_by_source,
 )
-from .typed_model import TypedNeighborhoodAutoencoder, score_masked_tokens, typed_reconstruction_loss
+from .typed_model import (
+    TypedNeighborhoodAutoencoder,
+    score_masked_tokens,
+    typed_reconstruction_loss,
+)
+
+
+def _require_checkpoint_graph_semantics(
+    checkpoint: Mapping[str, object], graph_dir: str | Path
+) -> str:
+    """Fail closed before a checkpoint sees graphs with different semantics."""
+
+    expected = load_graph_semantic_signature(graph_dir)
+    actual = str(checkpoint.get("graph_semantic_signature", "")).strip()
+    if not actual:
+        raise RuntimeError("checkpoint is missing its graph semantic signature")
+    if actual != expected:
+        raise RuntimeError(
+            "checkpoint/graph semantic signature mismatch; retrain on this compact corpus"
+        )
+    return expected
 
 
 def _model_from_graph(graph: Mapping[str, object], *, hidden_dim: int,
@@ -66,6 +94,7 @@ def train_typed_autoencoder(
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     records = load_compact_manifest(graph_dir)
+    graph_semantic_signature = load_graph_semantic_signature(graph_dir)
     paths_by_split = split_paths_by_source(records, train_fraction=train_fraction,
                                            validation_fraction=validation_fraction, seed=seed)
     record_by_path = {Path(record["path"]): record for record in records}
@@ -160,6 +189,7 @@ def train_typed_autoencoder(
         "schema_version": "typed_neighborhood_mae_v1", "state_dict": best_state,
         "model_config": model_config,
         "score_config": {"neighborhood_weight": neighborhood_weight, "route_weight": route_weight},
+        "graph_semantic_signature": graph_semantic_signature,
     })
     atomic_json(output / "splits.json", split_payload)
     atomic_json(output / "history.json", history)
@@ -167,7 +197,8 @@ def train_typed_autoencoder(
                                   "best_validation_loss": best_validation,
                                   "epochs_ran": len(history),
                                   "graphs": {name: len(paths) for name, paths in paths_by_split.items()},
-                                  "residency": residency, "device": str(requested)}
+                                  "residency": residency, "device": str(requested),
+                                  "graph_semantic_signature": graph_semantic_signature}
     atomic_json(output / "training_summary.json", summary)
     return summary
 
@@ -176,7 +207,7 @@ def train_typed_autoencoder(
 def score_graph_strided(
     model: TypedNeighborhoodAutoencoder, graph: Mapping[str, object], *, mask_stride: int,
     neighborhood_weight: float, route_weight: float, amp: str,
-) -> dict[str, torch.Tensor | str | int]:
+) -> dict[str, torch.Tensor | str]:
     """Cover every response token in a fixed number of vectorised mask views."""
 
     if mask_stride < 1:
@@ -195,11 +226,11 @@ def score_graph_strided(
             result = score_masked_tokens(model, graph, mask,
                                          neighborhood_weight=neighborhood_weight,
                                          route_weight=route_weight)
-        for name in collected:
-            collected[name].append(result[name].detach())
+        for name, values in collected.items():
+            values.append(result[name].detach())
     token_idx = torch.cat(collected["token_idx"])
     order = token_idx.argsort()
-    return {"source_id": str(graph["source_id"]), "original_idx": int(graph["original_idx"]),
+    return {"source_id": str(graph["source_id"]), "sample_id": str(graph["sample_id"]),
             **{name: torch.cat(values)[order] for name, values in collected.items()}}
 
 
@@ -240,6 +271,8 @@ def score_typed_autoencoder(
     checkpoint_path = Path(checkpoint_path)
     split_file = Path(split_file) if split_file else checkpoint_path.parent / "splits.json"
     records = load_compact_manifest(graph_dir)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    graph_semantic_signature = _require_checkpoint_graph_semantics(checkpoint, graph_dir)
     record_by_path = {Path(record["path"]): record for record in records}
     calibration_paths = _resolve_split_paths(graph_dir, split_file, "train")
     score_paths = _resolve_split_paths(graph_dir, split_file, partition)
@@ -257,7 +290,6 @@ def score_typed_autoencoder(
         raise RuntimeError(f"split references graphs outside the manifest: {sorted(unknown)}")
     store = CompactGraphStore([record_by_path[path] for path in selected_paths], device=device,
                               residency=residency, max_resident_gib=max_resident_gib)
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     model = TypedNeighborhoodAutoencoder(**checkpoint["model_config"]).to(device)
     model.load_state_dict(checkpoint["state_dict"], strict=True)
     score_config = checkpoint.get("score_config", {})
@@ -301,7 +333,7 @@ def score_typed_autoencoder(
                 token_indices, component_rows, calibrated_scores = (
                     result["token_idx"].cpu().tolist(), components.cpu().tolist(), calibrated.cpu().tolist())
                 rows = [json.dumps({"source_id": result["source_id"],
-                                    "original_idx": result["original_idx"], "token_idx": int(token_idx),
+                                    "sample_id": result["sample_id"], "token_idx": int(token_idx),
                                     "score": float(score), "node_residual": float(component[0]),
                                     "neighborhood_residual": float(component[1]), "route_residual": float(component[2])},
                                    ensure_ascii=False, separators=(",", ":"))
@@ -316,6 +348,7 @@ def score_typed_autoencoder(
                                   "mask_stride": mask_stride, "calibration_graphs": len(calibration_paths),
                                   "calibration_tokens": calibration_token_count,
                                   "calibration": calibration,
+                                  "graph_semantic_signature": graph_semantic_signature,
                                   "component_weights": [1.0, neighborhood_weight, route_weight]}
     atomic_json(Path(output_path).with_suffix(".summary.json"), summary)
     return summary

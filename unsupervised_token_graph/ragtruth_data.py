@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 import hashlib
 import json
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +12,6 @@ import numpy as np
 import torch
 
 from .ragtruth_graph import build_compact_topk_graph, load_attention_sample
-
 
 _FORBIDDEN_KEYS = {
     "gold", "is_correct", "is_hallucinated", "label", "labels", "target",
@@ -38,19 +37,30 @@ def validate_compact_graph(graph: object) -> None:
     """Validate a persisted graph before it enters GPU residency or training."""
 
     if not isinstance(graph, Mapping):
-        raise ValueError("compact graph must be a mapping")
+        raise TypeError("compact graph must be a mapping")
     validate_label_free(graph)
-    if graph.get("schema_version") != "ragtruth_typed_topk_v2":
-        raise ValueError("compact graph schema must be ragtruth_typed_topk_v2")
+    if graph.get("schema_version") != "ragtruth_typed_topk_v3":
+        raise ValueError("compact graph schema must be ragtruth_typed_topk_v3")
     required = {
-        "source_id", "original_idx", "response_idx", "x", "node_context",
+        "source_id", "sample_id", "response_idx", "x", "node_context",
         "edge_index", "edge_attr", "edge_type", "response_mask",
         "neighbor_mean_target", "neighbor_log_variance_target",
-        "route_stats_target",
+        "route_stats_target", "graph_config",
     }
     missing = required.difference(graph)
     if missing:
         raise ValueError(f"compact graph is missing fields: {sorted(missing)}")
+    if not str(graph["source_id"]).strip() or not str(graph["sample_id"]).strip():
+        raise ValueError("compact graph source_id and sample_id must be non-empty")
+    config = graph["graph_config"]
+    if not isinstance(config, Mapping):
+        raise TypeError("compact graph graph_config must be a mapping")
+    if not str(config.get("cache_format", "")).strip():
+        raise ValueError("compact graph graph_config.cache_format is required")
+    if config.get("cache_format") == "formal_sparse_csr" and not isinstance(
+        config.get("raw_identity"), Mapping
+    ):
+        raise ValueError("formal compact graph graph_config.raw_identity is required")
     x = torch.as_tensor(graph["x"])
     context = torch.as_tensor(graph["node_context"])
     edge_index = torch.as_tensor(graph["edge_index"]).long()
@@ -86,7 +96,7 @@ def validate_compact_graph(graph: object) -> None:
 def _tensor_device(graph: Mapping[str, object]) -> torch.device:
     value = graph.get("x")
     if not isinstance(value, torch.Tensor):
-        raise ValueError("graph.x must be a tensor")
+        raise TypeError("graph.x must be a tensor")
     return value.device
 
 
@@ -116,8 +126,13 @@ def collate_graphs(graphs: Sequence[Mapping[str, object]]) -> dict[str, object]:
         "response_mask": torch.cat([graph["response_mask"] for graph in graphs], dim=0).bool(),
         "graph_ptr": offsets,
         "source_id": [str(graph["source_id"]) for graph in graphs],
-        "original_idx": [int(graph["original_idx"]) for graph in graphs],
+        "sample_id": [str(graph["sample_id"]) for graph in graphs],
     }
+    original_indices = ["original_idx" in graph for graph in graphs]
+    if any(original_indices) and not all(original_indices):
+        raise ValueError("original_idx must be present in every graph or absent from every graph")
+    if all(original_indices):
+        batch["original_idx"] = [int(graph["original_idx"]) for graph in graphs]
     for name in (
         "node_context", "token_ids", "neighbor_mean_target",
         "neighbor_log_variance_target", "route_stats_target",
@@ -131,7 +146,7 @@ def collate_graphs(graphs: Sequence[Mapping[str, object]]) -> dict[str, object]:
 
 
 def _stable_key(source_id: str, seed: int) -> str:
-    return hashlib.sha256(f"{seed}\x1f{source_id}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{seed}\x1f{source_id}".encode()).hexdigest()
 
 
 def split_paths_by_source(
@@ -233,8 +248,6 @@ def _compact_for_disk(graph: Mapping[str, object], *, storage_dtype: torch.dtype
     integer_dtypes = {"edge_index": torch.int32, "edge_type": torch.int8, "token_ids": torch.int32}
     compact: dict[str, object] = {}
     for key, value in graph.items():
-        if key == "graph_config":
-            continue
         if not isinstance(value, torch.Tensor):
             compact[key] = value
         elif key in float_fields:
@@ -266,15 +279,192 @@ def atomic_torch_save(path: Path, value: object) -> None:
 
 
 def discover_attention_paths(attention_dir: str | Path, *, limit: int | None = None) -> list[Path]:
-    root = Path(attention_dir)
-    paths = sorted(root.rglob("*.pt"))
+    """Discover one homogeneous, flat raw-cache directory without guessing shards."""
+
+    root = Path(attention_dir).resolve()
+    if not root.is_dir():
+        raise NotADirectoryError(f"attention_dir must be an existing directory: {root}")
+    files = sorted(path for path in root.iterdir() if path.is_file() and path.suffix == ".pt")
+    formal = [path for path in files if path.name.startswith("attention_")]
+    legacy = [path for path in files if path.name.startswith("sample_")]
+    known = set(formal)
+    known.update(legacy)
+    unknown = [path.name for path in files if path not in known]
+    if unknown:
+        raise ValueError(
+            "attention_dir contains non-sample .pt files; pass the leaf raw-cache directory: "
+            + ", ".join(unknown[:8])
+        )
+    if formal and legacy:
+        raise ValueError("attention_dir mixes formal attention_*.pt and legacy sample_*.pt caches")
+    paths = formal or legacy
     if limit is not None:
         if limit < 1:
             raise ValueError("limit must be positive")
         paths = paths[:limit]
     if not paths:
-        raise ValueError(f"no .pt attention samples found under {root}")
+        raise ValueError(f"no root-level attention_*.pt or sample_*.pt cache files found under {root}")
     return paths
+
+
+def _json_identity(value: Mapping[str, object]) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _raw_cache_identity(sample: Mapping[str, object], stat: object) -> dict[str, object]:
+    cache_format = str(sample["cache_format"])
+    attention = torch.as_tensor(
+        sample["attention_diagonal"]
+        if cache_format == "formal_sparse_csr"
+        else sample["attention"]
+    )
+    if cache_format == "formal_sparse_csr":
+        layers = int(sample["num_attention_layers"])
+        heads = int(sample["num_attention_heads"])
+        token_count = int(torch.as_tensor(sample["token_ids"]).numel())
+        fingerprint: str | None = str(sample["attention_cache_fingerprint"])
+        cache_dtype = str(sample["cache_dtype"])
+        attention_floor: float | None = float(sample["attention_floor"])
+        input_policy: str | None = str(sample["input_policy"])
+        was_truncated: bool | None = bool(sample["was_truncated"])
+    else:
+        layers, heads, token_count = map(int, attention.shape[:3])
+        fingerprint = input_policy = None
+        cache_dtype = str(attention.dtype).removeprefix("torch.")
+        attention_floor = was_truncated = None
+    return {
+        "source_id": str(sample["source_id"]),
+        "sample_id": str(sample["sample_id"]),
+        "cache_format": cache_format,
+        "attention_cache_fingerprint": fingerprint,
+        "cache_dtype": cache_dtype,
+        "input_policy": input_policy,
+        "was_truncated": was_truncated,
+        "response_idx": int(sample["response_idx"]),
+        "token_count": token_count,
+        "layers": layers,
+        "heads": heads,
+        "attention_floor": attention_floor,
+        "source_size": int(stat.st_size),
+        "source_mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def _bind_graph_raw_identity(
+    graph: dict[str, object], raw_identity: Mapping[str, object]
+) -> None:
+    config = dict(graph["graph_config"])
+    config["raw_identity"] = dict(raw_identity)
+    graph["graph_config"] = config
+
+
+def _verify_graph_raw_identity(
+    graph: Mapping[str, object], expected: Mapping[str, object], path: Path
+) -> None:
+    config = graph.get("graph_config")
+    actual = config.get("raw_identity") if isinstance(config, Mapping) else None
+    if not isinstance(actual, Mapping):
+        raise RuntimeError(f"stale graph has no raw identity: {path}")  # noqa: TRY004
+    divergent = [key for key, value in expected.items() if actual.get(key) != value]
+    if divergent:
+        raise RuntimeError(
+            f"stale graph raw identity diverges for {path}: {', '.join(divergent)}"
+        )
+    if (
+        int(graph["response_idx"]) != int(expected["response_idx"])
+        or int(torch.as_tensor(graph["x"]).shape[0]) != int(expected["token_count"])
+        or str(graph["source_id"]) != str(expected["source_id"])
+        or str(graph["sample_id"]) != str(expected["sample_id"])
+    ):
+        raise RuntimeError(f"stale graph tensor identity diverges from raw cache: {path}")
+
+
+_SEMANTIC_CONFIG_KEYS = (
+    "cache_format", "attention_cache_schema", "selection_scope",
+    "feature_semantics", "attention_floor", "top_k", "top_k_prefix",
+    "top_k_history", "use_hidden", "hidden_projection_dim",
+)
+
+
+def _graph_semantics(graph: Mapping[str, object]) -> dict[str, object]:
+    config = graph["graph_config"]
+    if not isinstance(config, Mapping):
+        raise TypeError("graph_config must be a mapping")
+    return {
+        "graph_schema": str(graph["schema_version"]),
+        "node_dim": int(torch.as_tensor(graph["x"]).shape[1]),
+        "edge_dim": int(torch.as_tensor(graph["edge_attr"]).shape[1]),
+        "context_dim": int(torch.as_tensor(graph["node_context"]).shape[1]),
+        "route_dim": int(torch.as_tensor(graph["route_stats_target"]).shape[-1]),
+        "storage_dtype": str(torch.as_tensor(graph["x"]).dtype).removeprefix("torch."),
+        "edge_types": 2,
+        "construction": {key: config.get(key) for key in _SEMANTIC_CONFIG_KEYS},
+    }
+
+
+def _semantic_signature(semantics: Mapping[str, object]) -> str:
+    return hashlib.sha256(_json_identity(semantics).encode("utf-8")).hexdigest()
+
+
+def load_graph_semantic_signature(graph_dir: str | Path) -> str:
+    path = Path(graph_dir) / "manifest.json"
+    if not path.is_file():
+        raise FileNotFoundError(f"compact manifest not found: {path}")
+    summary = json.loads(path.read_text(encoding="utf-8"))
+    signature = str(summary.get("graph_semantic_signature", "")).strip()
+    if not signature:
+        raise RuntimeError("compact manifest is missing graph_semantic_signature")
+    return signature
+
+
+def _preflight_attention_samples(paths: Sequence[Path]) -> dict[Path, dict[str, object]]:
+    """Validate formal sparse or legacy dense caches before GPU allocation."""
+
+    metadata: dict[Path, dict[str, object]] = {}
+    failures: list[str] = []
+    identities: set[tuple[str, str]] = set()
+    for path in paths:
+        try:
+            before = path.stat()
+            sample = load_attention_sample(path, device="cpu", mmap=True, include_labels=False)
+            after = path.stat()
+            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                raise RuntimeError("raw cache changed during preflight")
+            sample_id = str(sample["sample_id"])
+            source_id = str(sample["source_id"])
+            cache_format = str(sample["cache_format"])
+            expected_format = (
+                "formal_sparse_csr"
+                if path.name.startswith("attention_")
+                else "legacy_dense"
+            )
+            if cache_format != expected_format:
+                raise ValueError(
+                    f"filename/cache format mismatch: {path.name} declares {cache_format!r}"
+                )
+            attention_name = (
+                "attention_diagonal"
+                if cache_format == "formal_sparse_csr"
+                else "attention"
+            )
+            attention = torch.as_tensor(sample[attention_name])
+            if not sample_id or not source_id or not cache_format or not attention.is_floating_point():
+                raise ValueError("sample_id/source_id/cache_format must be non-empty and attention floating")
+            identity = (source_id, sample_id)
+            if identity in identities:
+                raise ValueError(f"duplicate (source_id, sample_id): {identity}")
+            identities.add(identity)
+            raw_identity = _raw_cache_identity(sample, after)
+            metadata[path] = {**raw_identity, "raw_identity": raw_identity}
+            del sample
+        except Exception as error:  # noqa: BLE001 - aggregate all corrupt-cache failures
+            failures.append(f"{path.name}: {type(error).__name__}: {error}")
+    if failures:
+        raise ValueError(
+            f"raw attention preflight failed for {len(failures)}/{len(paths)} files; "
+            + " | ".join(failures[:8])
+        )
+    return metadata
 
 
 def compact_attention_cache(
@@ -283,7 +473,7 @@ def compact_attention_cache(
     layer_chunk: int = 2, storage_dtype: str = "float16", limit: int | None = None,
     resume: bool = False,
 ) -> dict[str, object]:
-    """Stream legacy dense caches into compact graphs using one GPU sample at a time."""
+    """Compact formal sparse-CSR or legacy dense caches one GPU sample at a time."""
 
     requested = torch.device(device)
     if requested.type != "cuda":
@@ -293,11 +483,18 @@ def compact_attention_cache(
     dtype_by_name = {"float16": torch.float16, "float32": torch.float32}
     if storage_dtype not in dtype_by_name:
         raise ValueError("storage_dtype must be float16 or float32")
-    source_root, destination = Path(attention_dir), Path(output_dir)
+    source_root, destination = Path(attention_dir).resolve(), Path(output_dir).resolve()
+    if source_root == destination or source_root in destination.parents or destination in source_root.parents:
+        raise ValueError("attention_dir and output_dir must not be equal or nested")
+    paths = discover_attention_paths(source_root)
+    if limit is not None:
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        paths = paths[:limit]
+    metadata = _preflight_attention_samples(paths)
     graph_dir = destination / "graphs"
     graph_dir.mkdir(parents=True, exist_ok=True)
-    paths = discover_attention_paths(source_root, limit=limit)
-    identity = json.dumps({"builder_schema": "ragtruth_typed_topk_v2",
+    identity = json.dumps({"builder_schema": "ragtruth_typed_topk_v3",
                            "prefix_top_k": prefix_top_k, "history_top_k": history_top_k,
                            "query_block": query_block, "layer_chunk": layer_chunk,
                            "storage_dtype": storage_dtype, "uses_hidden": False},
@@ -308,10 +505,20 @@ def compact_attention_cache(
         raise RuntimeError("tqdm is required; install requirements-unsupervised-token-graph.txt") from error
     records: list[dict[str, object]] = []
     feature_dims: set[tuple[int, int]] = set()
-    identities: set[tuple[str, int]] = set()
+    semantic_payloads: dict[str, dict[str, object]] = {}
+    identities: set[tuple[str, str]] = set()
     for path in tqdm(paths, desc="compact attention -> token graphs", unit="sample"):
         relative = path.relative_to(source_root).as_posix()
-        digest = hashlib.sha256(f"{relative}\x1f{identity}".encode("utf-8")).hexdigest()[:16]
+        raw = metadata[path]
+        current = path.stat()
+        if (current.st_size, current.st_mtime_ns) != (
+            raw["source_size"], raw["source_mtime_ns"]
+        ):
+            raise RuntimeError(f"raw cache changed after preflight: {path}")
+        raw_json = _json_identity(raw["raw_identity"])
+        digest = hashlib.sha256(
+            f"{relative}\x1f{identity}\x1f{raw_json}".encode()
+        ).hexdigest()[:16]
         graph_path = graph_dir / f"{path.stem}_{digest}.pt"
         if graph_path.exists() and not resume:
             raise FileExistsError(f"compact graph already exists: {graph_path}; pass --resume to reuse it")
@@ -320,24 +527,44 @@ def compact_attention_cache(
             validate_compact_graph(graph)
         else:
             sample = load_attention_sample(path, device="cpu", mmap=True, include_labels=False)
+            loaded_stat = path.stat()
+            actual_identity = _raw_cache_identity(sample, loaded_stat)
+            if _json_identity(actual_identity) != raw_json:
+                raise RuntimeError(f"raw cache changed between preflight and graph build: {path}")
             graph_on_gpu = build_compact_topk_graph(
                 sample, top_k=max(prefix_top_k, history_top_k),
                 top_k_prefix=prefix_top_k, top_k_history=history_top_k,
                 query_block=query_block, layer_chunk=layer_chunk, device=requested,
                 use_hidden=False,
             )
+            _bind_graph_raw_identity(graph_on_gpu, actual_identity)
             graph = _compact_for_disk(graph_on_gpu, storage_dtype=dtype_by_name[storage_dtype])
             atomic_torch_save(graph_path, graph)
             del graph_on_gpu, sample
+        _verify_graph_raw_identity(graph, raw["raw_identity"], path)
+        semantics = _graph_semantics(graph)
+        semantic_signature = _semantic_signature(semantics)
+        semantic_payloads[semantic_signature] = semantics
         node_dim, edge_dim = int(graph["x"].shape[1]), int(graph["edge_attr"].shape[1])
         feature_dims.add((node_dim, edge_dim))
-        sample_identity = (str(graph["source_id"]), int(graph["original_idx"]))
+        sample_identity = (str(graph["source_id"]), str(graph["sample_id"]))
         if sample_identity in identities:
             raise ValueError(f"duplicate attention sample identity: {sample_identity}")
         identities.add(sample_identity)
         records.append({"path": graph_path.relative_to(destination).as_posix(),
                         "source_file": relative, "source_id": str(graph["source_id"]),
-                        "original_idx": int(graph["original_idx"]),
+                        "sample_id": str(graph["sample_id"]),
+                        "cache_format": str(graph["graph_config"]["cache_format"]),
+                        "attention_floor": raw["attention_floor"],
+                        "attention_cache_fingerprint": raw["attention_cache_fingerprint"],
+                        "cache_dtype": raw["cache_dtype"],
+                        "input_policy": raw["input_policy"],
+                        "was_truncated": raw["was_truncated"],
+                        "response_idx": int(graph["response_idx"]),
+                        "token_count": raw["token_count"],
+                        "layers": raw["layers"], "heads": raw["heads"],
+                        "raw_identity_sha256": hashlib.sha256(raw_json.encode("utf-8")).hexdigest(),
+                        "graph_semantic_signature": semantic_signature,
                         "node_count": int(graph["x"].shape[0]),
                         "response_count": int(graph["response_mask"].sum()),
                         "edge_count": int(graph["edge_index"].shape[1]),
@@ -345,19 +572,25 @@ def compact_attention_cache(
         del graph
     if len(feature_dims) != 1:
         raise ValueError(f"inconsistent compact graph dimensions: {sorted(feature_dims)}")
+    if len(semantic_payloads) != 1:
+        raise ValueError("compact corpus mixes incompatible graph feature semantics")
     node_dim, edge_dim = feature_dims.pop()
+    graph_semantic_signature, graph_semantics = next(iter(semantic_payloads.items()))
     atomic_jsonl(destination / "manifest.jsonl", records)
     summary: dict[str, object] = {
-        "schema_version": "ragtruth_typed_topk_corpus_v2", "state": "complete",
+        "schema_version": "ragtruth_typed_topk_corpus_v3", "state": "complete",
         "samples": len(records), "source_groups": len({record["source_id"] for record in records}),
         "nodes": sum(int(record["node_count"]) for record in records),
         "edges": sum(int(record["edge_count"]) for record in records),
         "compact_bytes": sum(int(record["bytes"]) for record in records),
         "node_dim": node_dim, "edge_dim": edge_dim,
+        "graph_semantic_signature": graph_semantic_signature,
+        "graph_semantics": graph_semantics,
         "config": {"prefix_top_k": prefix_top_k, "history_top_k": history_top_k,
                    "query_block": query_block, "layer_chunk": layer_chunk,
                    "storage_dtype": storage_dtype, "raw_loader": "cpu_mmap",
-                   "graph_builder": str(requested), "uses_hidden": False},
+                   "graph_builder": str(requested), "uses_hidden": False,
+                   "discovery": "root_attention_or_sample_pt_preflight"},
     }
     atomic_json(destination / "manifest.json", summary)
     return summary
@@ -371,13 +604,27 @@ def load_compact_manifest(graph_dir: str | Path) -> list[dict[str, object]]:
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     if summary.get("state") != "complete":
         raise RuntimeError(f"compact graph corpus is incomplete: {summary_path}")
-    if summary.get("schema_version") != "ragtruth_typed_topk_corpus_v2":
+    if summary.get("schema_version") != "ragtruth_typed_topk_corpus_v3":
         raise RuntimeError(f"incompatible compact corpus schema: {summary_path}")
+    semantic_signature = str(summary.get("graph_semantic_signature", "")).strip()
+    if not semantic_signature:
+        raise RuntimeError("compact manifest is missing graph_semantic_signature")
     root_resolved, records = root.resolve(), []
     for line in records_path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         record = dict(json.loads(line))
+        if not all(str(record.get(name, "")).strip() for name in ("source_id", "sample_id", "cache_format")):
+            raise RuntimeError("compact manifest record is missing source_id/sample_id/cache_format")
+        required_metadata = {
+            "attention_floor", "attention_cache_fingerprint", "cache_dtype",
+            "input_policy", "was_truncated", "response_idx", "token_count",
+            "layers", "heads", "raw_identity_sha256", "graph_semantic_signature",
+        }
+        if not required_metadata.issubset(record):
+            raise RuntimeError("compact manifest record is missing raw identity metadata")
+        if record["graph_semantic_signature"] != semantic_signature:
+            raise RuntimeError("compact manifest mixes graph semantic signatures")
         path = (root / str(record["path"])).resolve()
         if root_resolved not in path.parents or not path.is_file():
             raise RuntimeError(f"unsafe or missing compact graph path: {path}")

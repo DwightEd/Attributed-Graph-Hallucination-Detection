@@ -10,8 +10,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 
 
 def _field(graph: Mapping[str, object] | object, name: str):
@@ -298,8 +298,8 @@ def score_masked_tokens(
     if was_training:
         model.train()
     return {
-        "original_idx": _field(graph, "original_idx"),
         "source_id": _field(graph, "source_id"),
+        "sample_id": _field(graph, "sample_id"),
         "token_idx": torch.nonzero(selected, as_tuple=False).flatten(),
         "scores": score[selected],
         "node_scores": node_score[selected],
