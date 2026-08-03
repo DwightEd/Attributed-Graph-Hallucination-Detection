@@ -37,7 +37,19 @@ class FeaturePilotShellContractTests(unittest.TestCase):
         self.assertIn(
             "raw.githubusercontent.com/RUCAIBox/HaluEval/", script
         )
-        self.assertIn("storage.googleapis.com/boolq/dev.jsonl", script)
+        self.assertNotIn("storage.googleapis.com/boolq/dev.jsonl", script)
+        self.assertIn("datasets-server.huggingface.co/rows", script)
+        self.assertIn("num_rows_total", script)
+        self.assertIn("expected_rows = 3270", script)
+        self.assertIn("validate_boolq_file", script)
+        self.assertIn(
+            'if [[ -s "${BOOLQ_DATA}" ]] && '
+            'validate_boolq_file "${BOOLQ_DATA}"; then',
+            script,
+        )
+        self.assertIn(
+            'download_boolq_from_huggingface "${BOOLQ_DATA}"', script
+        )
         self.assertIn("curl", script)
         self.assertNotIn("download_halueval_boolq.sh", script)
         self.assertNotIn("dataset_manifest.json", script)
@@ -46,7 +58,7 @@ class FeaturePilotShellContractTests(unittest.TestCase):
             script.index("run_dataset halueval_qa"),
         )
         self.assertLess(
-            script.index("download_if_missing boolq_dev"),
+            script.index('download_boolq_from_huggingface "${BOOLQ_DATA}"'),
             script.index("run_dataset boolq"),
         )
         self.assertIn("flock -n", script)

@@ -22,7 +22,7 @@ RUN_ROOT="${RUN_ROOT:-${DATA_ROOT}/feature_extraction/token_graph_pilot_v4_gpu_$
 HALUEVAL_DATA="${DATA_ROOT}/HaluEval/qa_data.json"
 BOOLQ_DATA="${DATA_ROOT}/BoolQ/dev.jsonl"
 HALUEVAL_URL="https://raw.githubusercontent.com/RUCAIBox/HaluEval/b7253db3cdaa0ab2c382f92b26b390109174f77e/data/qa_data.json"
-BOOLQ_URL="https://storage.googleapis.com/boolq/dev.jsonl"
+BOOLQ_HF_ROWS_URL="https://datasets-server.huggingface.co/rows"
 
 case "${DTYPE}" in
   float16|bfloat16|float32) ;;
@@ -84,6 +84,7 @@ download_if_missing() {
     exit 2
   fi
   if [[ ! -s "${temporary}" ]]; then
+    rm -f -- "${temporary}"
     echo "Downloaded an empty ${dataset_name} file: ${temporary}" >&2
     exit 2
   fi
@@ -91,9 +92,163 @@ download_if_missing() {
   echo "Downloaded ${dataset_name}: ${destination}"
 }
 
+validate_boolq_file() {
+  local source_path="$1"
+  "${PYTHON_BIN}" - "${source_path}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+
+source_path = Path(sys.argv[1])
+expected_rows = 3270
+rows = 0
+with source_path.open(encoding="utf-8") as source:
+    for line_number, line in enumerate(source, start=1):
+        if not line.strip():
+            raise ValueError(f"BoolQ line {line_number} is empty")
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            raise ValueError(f"BoolQ line {line_number} is not an object")
+        if not isinstance(row.get("question"), str) or not row["question"].strip():
+            raise ValueError(f"BoolQ line {line_number} has an invalid question")
+        if not isinstance(row.get("passage"), str) or not row["passage"].strip():
+            raise ValueError(f"BoolQ line {line_number} has an invalid passage")
+        if not isinstance(row.get("answer"), bool):
+            raise ValueError(f"BoolQ line {line_number} has a non-boolean answer")
+        rows += 1
+if rows != expected_rows:
+    raise ValueError(f"Expected {expected_rows} BoolQ rows, found {rows}")
+print(f"Validated BoolQ: {rows} rows", flush=True)
+PY
+}
+
+download_boolq_from_huggingface() {
+  local destination="$1"
+  local temporary="${destination}.$$.part"
+
+  mkdir -p "$(dirname -- "${destination}")"
+  echo "Downloading the Google BoolQ validation split from Hugging Face"
+  if "${PYTHON_BIN}" - "${temporary}" "${BOOLQ_HF_ROWS_URL}" <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+
+output_path = Path(sys.argv[1])
+endpoint = sys.argv[2]
+expected_rows = 3270
+page_size = 100
+retry_delay_seconds = float(
+    os.environ.get("BOOLQ_DOWNLOAD_RETRY_DELAY_SECONDS", "2")
+)
+if retry_delay_seconds < 0:
+    raise ValueError("BOOLQ_DOWNLOAD_RETRY_DELAY_SECONDS cannot be negative")
+
+
+def fetch_page(offset: int, length: int) -> dict[str, object]:
+    query = urllib.parse.urlencode(
+        {
+            "dataset": "google/boolq",
+            "config": "default",
+            "split": "validation",
+            "offset": offset,
+            "length": length,
+        }
+    )
+    request = urllib.request.Request(
+        f"{endpoint}?{query}",
+        headers={"User-Agent": "boolq-attention-pilot/1.0"},
+    )
+    last_error: Exception | None = None
+    for attempt in range(1, 5):
+        try:
+            with urllib.request.urlopen(request, timeout=90) as response:
+                payload = json.load(response)
+            if not isinstance(payload, dict):
+                raise ValueError("Hugging Face rows response is not an object")
+            return payload
+        except Exception as error:
+            last_error = error
+            if attempt < 4:
+                time.sleep(retry_delay_seconds * 2 ** (attempt - 1))
+    raise RuntimeError(
+        f"Could not fetch BoolQ rows at offset {offset}: {last_error}"
+    )
+
+
+written = 0
+with output_path.open("w", encoding="utf-8") as output:
+    while written < expected_rows:
+        payload = fetch_page(written, min(page_size, expected_rows - written))
+        if payload.get("num_rows_total") != expected_rows:
+            raise ValueError(
+                "Google BoolQ validation split no longer contains "
+                f"{expected_rows} rows: {payload.get('num_rows_total')!r}"
+            )
+        rows = payload.get("rows")
+        if not isinstance(rows, list) or not rows:
+            raise ValueError(f"No BoolQ rows returned at offset {written}")
+        for item in rows:
+            if not isinstance(item, dict) or item.get("row_idx") != written:
+                raise ValueError(f"Unexpected BoolQ row index at offset {written}")
+            if item.get("truncated_cells"):
+                raise ValueError(f"BoolQ row {written} contains truncated cells")
+            row = item.get("row")
+            if not isinstance(row, dict):
+                raise ValueError(f"BoolQ row {written} is not an object")
+            if not isinstance(row.get("question"), str) or not row["question"].strip():
+                raise ValueError(f"BoolQ row {written} has an invalid question")
+            if not isinstance(row.get("passage"), str) or not row["passage"].strip():
+                raise ValueError(f"BoolQ row {written} has an invalid passage")
+            if not isinstance(row.get("answer"), bool):
+                raise ValueError(f"BoolQ row {written} has a non-boolean answer")
+            output.write(json.dumps(row, ensure_ascii=False) + "\n")
+            written += 1
+        print(f"Downloaded BoolQ validation: {written}/{expected_rows}", flush=True)
+    output.flush()
+    os.fsync(output.fileno())
+
+if written != expected_rows:
+    raise RuntimeError(f"Expected {expected_rows} BoolQ rows, wrote {written}")
+PY
+  then
+    if ! mv -- "${temporary}" "${destination}"; then
+      rm -f -- "${temporary}"
+      echo "Failed to publish BoolQ dataset: ${destination}" >&2
+      return 1
+    fi
+    echo "Downloaded boolq_dev: ${destination}"
+  else
+    rm -f -- "${temporary}"
+    echo "Failed to download BoolQ from Hugging Face" >&2
+    return 1
+  fi
+}
+
 if [[ "${DOWNLOAD_DATA}" == "1" ]]; then
   download_if_missing halueval_qa "${HALUEVAL_URL}" "${HALUEVAL_DATA}"
-  download_if_missing boolq_dev "${BOOLQ_URL}" "${BOOLQ_DATA}"
+  if [[ -s "${BOOLQ_DATA}" ]] && validate_boolq_file "${BOOLQ_DATA}"; then
+    echo "Reusing boolq_dev: ${BOOLQ_DATA}"
+  else
+    if [[ -e "${BOOLQ_DATA}" ]]; then
+      echo "Existing BoolQ file is invalid; downloading a verified replacement"
+    fi
+    download_boolq_from_huggingface "${BOOLQ_DATA}"
+    validate_boolq_file "${BOOLQ_DATA}"
+  fi
+else
+  if [[ ! -s "${BOOLQ_DATA}" ]]; then
+    echo "Missing dataset file: ${BOOLQ_DATA}" >&2
+    exit 2
+  fi
+  validate_boolq_file "${BOOLQ_DATA}"
 fi
 
 for dataset_file in "${HALUEVAL_DATA}" "${BOOLQ_DATA}"; do
