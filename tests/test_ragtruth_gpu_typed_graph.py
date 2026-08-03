@@ -47,7 +47,11 @@ def _contains_label_key(value) -> bool:
 
 
 def _test_device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    """Return an exact device, including CUDA's currently selected index."""
+
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    return torch.device("cuda", torch.cuda.current_device())
 
 
 def _legacy_attention() -> torch.Tensor:
