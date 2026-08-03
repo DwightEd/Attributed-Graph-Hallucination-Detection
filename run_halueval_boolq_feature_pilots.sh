@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
-DATA_ROOT="${DATA_ROOT:-/share/home/tm902089733300000/a903202310/lys/data}"
+DATA_ROOT="${DATA_ROOT:-/share/home/tm902089733300000/a903202310/lys/research/data}"
 MODEL_PATH="${MODEL_PATH:-/share/home/tm902089733300000/a903202310/lys/models/Meta-Llama-3.1-8B-Instruct}"
 GPU_ID="${GPU_ID:-0}"
 DEVICE="cuda:0"
@@ -19,6 +19,10 @@ GPU_BUSY_LIMIT_MIB="${GPU_BUSY_LIMIT_MIB:-512}"
 ALLOW_BUSY_GPU="${ALLOW_BUSY_GPU:-0}"
 DOWNLOAD_DATA="${DOWNLOAD_DATA:-1}"
 RUN_ROOT="${RUN_ROOT:-${DATA_ROOT}/feature_extraction/token_graph_pilot_v4_gpu_${PILOT_LIMIT}}"
+HALUEVAL_DATA="${DATA_ROOT}/HaluEval/qa_data.json"
+BOOLQ_DATA="${DATA_ROOT}/BoolQ/dev.jsonl"
+HALUEVAL_URL="https://raw.githubusercontent.com/RUCAIBox/HaluEval/b7253db3cdaa0ab2c382f92b26b390109174f77e/data/qa_data.json"
+BOOLQ_URL="https://storage.googleapis.com/boolq/dev.jsonl"
 
 case "${DTYPE}" in
   float16|bfloat16|float32) ;;
@@ -42,6 +46,64 @@ if [[ ! "${CPU_THREADS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "CPU_THREADS must be a positive integer" >&2
   exit 2
 fi
+case "${DOWNLOAD_DATA}" in
+  0|1) ;;
+  *)
+    echo "DOWNLOAD_DATA must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+
+download_if_missing() {
+  local dataset_name="$1"
+  local source_url="$2"
+  local destination="$3"
+  local temporary="${destination}.$$.part"
+
+  if [[ -s "${destination}" ]]; then
+    echo "Reusing ${dataset_name}: ${destination}"
+    return
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "curl is required to download ${dataset_name}" >&2
+    exit 2
+  fi
+
+  mkdir -p "$(dirname -- "${destination}")"
+  echo "Downloading ${dataset_name}: ${source_url}"
+  if ! curl \
+      --fail \
+      --location \
+      --retry 5 \
+      --retry-delay 2 \
+      --connect-timeout 30 \
+      --output "${temporary}" \
+      "${source_url}"; then
+    rm -f -- "${temporary}"
+    echo "Failed to download ${dataset_name}" >&2
+    exit 2
+  fi
+  if [[ ! -s "${temporary}" ]]; then
+    echo "Downloaded an empty ${dataset_name} file: ${temporary}" >&2
+    exit 2
+  fi
+  mv -- "${temporary}" "${destination}"
+  echo "Downloaded ${dataset_name}: ${destination}"
+}
+
+if [[ "${DOWNLOAD_DATA}" == "1" ]]; then
+  download_if_missing halueval_qa "${HALUEVAL_URL}" "${HALUEVAL_DATA}"
+  download_if_missing boolq_dev "${BOOLQ_URL}" "${BOOLQ_DATA}"
+fi
+
+for dataset_file in "${HALUEVAL_DATA}" "${BOOLQ_DATA}"; do
+  if [[ ! -s "${dataset_file}" ]]; then
+    echo "Missing dataset file: ${dataset_file}" >&2
+    exit 2
+  fi
+done
+
+echo "Datasets are ready; no dataset manifest is required."
 
 if [[ ! -d "${MODEL_PATH}" ]]; then
   echo "Model directory does not exist: ${MODEL_PATH}" >&2
@@ -67,23 +129,6 @@ if ! flock -n 8; then
   echo "Another process is already writing ${RUN_ROOT}" >&2
   exit 2
 fi
-
-if [[ "${DOWNLOAD_DATA}" == "1" ]]; then
-  DATA_ROOT="${DATA_ROOT}" PYTHON_BIN="${PYTHON_BIN}" \
-    bash "${SCRIPT_DIR}/download_halueval_boolq.sh"
-else
-  DATA_ROOT="${DATA_ROOT}" PYTHON_BIN="${PYTHON_BIN}" OFFLINE_ONLY=1 \
-    bash "${SCRIPT_DIR}/download_halueval_boolq.sh"
-fi
-
-HALUEVAL_DATA="${DATA_ROOT}/HaluEval/qa_data.json"
-BOOLQ_DATA="${DATA_ROOT}/BoolQ/dev.jsonl"
-for dataset_file in "${HALUEVAL_DATA}" "${BOOLQ_DATA}"; do
-  if [[ ! -s "${dataset_file}" ]]; then
-    echo "Missing validated dataset: ${dataset_file}" >&2
-    exit 2
-  fi
-done
 
 GPU_MEMORY_USED_MIB="$(
   nvidia-smi --id="${GPU_ID}" --query-gpu=memory.used \

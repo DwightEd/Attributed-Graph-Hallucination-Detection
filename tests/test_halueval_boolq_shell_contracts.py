@@ -34,10 +34,24 @@ class FeaturePilotShellContractTests(unittest.TestCase):
         self.assertIn("run_dataset boolq", script)
         self.assertIn("RUN_TRAINING=0", script)
         self.assertNotIn("&\n", script)
-        self.assertIn("download_halueval_boolq.sh", script)
+        self.assertIn(
+            "raw.githubusercontent.com/RUCAIBox/HaluEval/", script
+        )
+        self.assertIn("storage.googleapis.com/boolq/dev.jsonl", script)
+        self.assertIn("curl", script)
+        self.assertNotIn("download_halueval_boolq.sh", script)
+        self.assertNotIn("dataset_manifest.json", script)
+        self.assertLess(
+            script.index("download_if_missing halueval_qa"),
+            script.index("run_dataset halueval_qa"),
+        )
+        self.assertLess(
+            script.index("download_if_missing boolq_dev"),
+            script.index("run_dataset boolq"),
+        )
         self.assertIn("flock -n", script)
         self.assertIn("PYTHONUNBUFFERED=1", script)
-        self.assertIn("OFFLINE_ONLY=1", script)
+        self.assertNotIn("OFFLINE_ONLY", script)
         self.assertIn('POSTPROCESS_DEVICE="${POSTPROCESS_DEVICE:-auto}"', script)
         self.assertIn('RETAIN_DENSE_ATTENTION="${RETAIN_DENSE_ATTENTION:-0}"', script)
         self.assertIn('OMP_NUM_THREADS="${CPU_THREADS}"', script)
