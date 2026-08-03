@@ -3,3 +3,5 @@ torch>=2.2
 transformers>=4.44
 safetensors>=0.4
 sentencepiece>=0.2
+scikit-learn>=1.5
+tqdm>=4.66
