@@ -14,7 +14,7 @@ import math
 import os
 import uuid
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -784,6 +784,7 @@ def prepare_legacy_halueval_graphs(
     build_device: str | torch.device = "cpu",
     resume: bool = True,
     mmap: bool = True,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[PreparedGraphRecord]:
     """Convert complete legacy pairs and prepare standard mmap graph artifacts.
 
@@ -809,7 +810,10 @@ def prepare_legacy_halueval_graphs(
 
     destination = Path(output_dir).expanduser().resolve()
     cache_root = destination / "adapted_cache"
-    for record, response_id in zip(records, response_ids):
+    total = len(records)
+    for current, (record, response_id) in enumerate(
+        zip(records, response_ids), start=1
+    ):
         trace_value = _record_value(record, "trace_path")
         if trace_value is None:
             raise ValueError("legacy graph preparation requires a complete graph and trace for every response")
@@ -825,6 +829,8 @@ def prepare_legacy_halueval_graphs(
         cache_path = cache_root / split / _legacy_cache_name(record)
         _remove_stale_response_caches(cache_path.parent, response_id=response_id, keep=cache_path)
         if resume and cache_path.is_file() and _reusable_formal_cache(cache_path, expected_identity):
+            if progress_callback is not None:
+                progress_callback(current, total)
             continue
         formal = legacy_graph_to_formal_attention_cache(
             legacy_graph,
@@ -836,6 +842,8 @@ def prepare_legacy_halueval_graphs(
         if str(formal["response_id"]) != response_id:
             raise ValueError("legacy record and graph response_id identity mismatch")
         _atomic_torch_save(cache_path, formal)
+        if progress_callback is not None:
+            progress_callback(current, total)
 
     prepared = data.prepare_graphs(
         cache_root=cache_root,

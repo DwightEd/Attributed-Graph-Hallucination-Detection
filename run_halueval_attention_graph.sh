@@ -115,7 +115,8 @@ printf 'source_run=%s\n' "${SOURCE_RUN}"
 printf 'output_dir=%s\n' "${OUTPUT_DIR}"
 printf 'gpu=%s device=%s seed=%s epochs=%s selection=%s\n' \
   "${CUDA_VISIBLE_DEVICES}" "${DEVICE}" "${SEED}" "${EPOCHS}" "${SELECTION}"
-printf 'Warning: legacy tau-censored compatibility; this is not the dense/floor-0.01 protocol.\n' >&2
+printf '%s\n' \
+  'NOTICE: using a legacy tau-censored graph cache. Values below its recorded floor cannot be recovered; inspect input_protocol before treating this as a floor-0.01 run.'
 
 ARGS=(
   --source-run "${SOURCE_RUN}"

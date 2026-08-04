@@ -87,6 +87,49 @@ def _fake_graph_loader(records: list[SimpleNamespace]):
 
 
 class HaluEvalAttentionGraphCliParserTests(unittest.TestCase):
+    def test_protocol_summary_exposes_the_effective_legacy_attention_floor(self):
+        from attention_graph.halueval_cli import _legacy_protocol_summary
+
+        summary = _legacy_protocol_summary(
+            [SimpleNamespace(legacy_tau=0.05), SimpleNamespace(legacy_tau=0.05)],
+            selection="threshold",
+            threshold=None,
+        )
+
+        self.assertEqual(summary["event"], "input_protocol")
+        self.assertEqual(summary["mode"], "legacy_tau_censored")
+        self.assertEqual(summary["legacy_attention_floor_values"], [0.05])
+        self.assertEqual(summary["effective_threshold"], "cache_floor")
+        self.assertFalse(summary["supports_floor_0_01"])
+
+    def test_protocol_summary_marks_threshold_inapplicable_for_top_k_selection(self):
+        from attention_graph.halueval_cli import _legacy_protocol_summary
+
+        summary = _legacy_protocol_summary(
+            [SimpleNamespace(legacy_tau=0.05)],
+            selection="typed_topk",
+            threshold=0.10,
+        )
+
+        self.assertIsNone(summary["effective_threshold"])
+
+    def test_prepare_progress_is_throttled_but_always_reports_start_and_finish(self):
+        from attention_graph.halueval_cli import _print_prepare_progress
+
+        with mock.patch("builtins.print") as printed:
+            for current in (1, 2, 25, 49, 50):
+                _print_prepare_progress(current, 50)
+
+        payloads = [json.loads(call.args[0]) for call in printed.call_args_list]
+        self.assertEqual(
+            payloads,
+            [
+                {"event": "prepare_progress", "current": 1, "total": 50},
+                {"event": "prepare_progress", "current": 25, "total": 50},
+                {"event": "prepare_progress", "current": 50, "total": 50},
+            ],
+        )
+
     def test_run_parser_exposes_label_free_input_and_experiment_controls(self):
         from attention_graph.halueval_cli import build_parser
 

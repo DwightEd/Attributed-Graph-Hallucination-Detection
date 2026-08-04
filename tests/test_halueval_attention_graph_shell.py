@@ -136,7 +136,13 @@ class HaluEvalAttentionGraphShellTests(unittest.TestCase):
             script,
         )
         self.assertIn(
-            'Warning: legacy tau-censored compatibility; this is not the dense/floor-0.01 protocol.',
+            'NOTICE: using a legacy tau-censored graph cache. Values below its '
+            'recorded floor cannot be recovered; inspect input_protocol before '
+            'treating this as a floor-0.01 run.',
+            script,
+        )
+        self.assertNotIn(
+            'Warning: legacy tau-censored compatibility',
             script,
         )
 

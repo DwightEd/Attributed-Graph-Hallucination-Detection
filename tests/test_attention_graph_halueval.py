@@ -711,6 +711,31 @@ class LegacyPreparationIntegrationTests(unittest.TestCase):
             self.assertEqual(cache["response_column_indices"].dtype, torch.int32)
             self.assertEqual(cache["response_row_ptr"].dtype, torch.int64)
 
+    def test_prepare_reports_conversion_progress_for_every_requested_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            graph_path, trace_path = root / "graph.pt", root / "trace.pt"
+            torch.save(_legacy_graph(), graph_path)
+            torch.save(_trace_metadata(), trace_path)
+            record = {
+                "response_id": "candidate-a",
+                "pair_id": "pair-a",
+                "graph_path": graph_path,
+                "trace_path": trace_path,
+            }
+            progress: list[tuple[int, int]] = []
+
+            prepare_legacy_halueval_graphs(
+                [record],
+                output_dir=root / "prepared",
+                config=GraphBuildConfig(selection="threshold", threshold=0.05),
+                progress_callback=lambda current, total: progress.append(
+                    (current, total)
+                ),
+            )
+
+            self.assertEqual(progress, [(1, 1)])
+
 
 class HaluEvalResponseEvaluationTests(unittest.TestCase):
     def test_explicit_sidecar_and_exact_response_join_produce_rank_and_paired_metrics(self):

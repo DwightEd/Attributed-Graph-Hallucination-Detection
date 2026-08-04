@@ -134,6 +134,19 @@ def _write_jsonl(path: Path, records: Sequence[Mapping[str, object]]) -> None:
     os.replace(temporary, path)
 
 
+def _print_prepare_progress(current: int, total: int) -> None:
+    """Keep long legacy-cache conversion visibly alive without flooding logs."""
+
+    if current == 1 or current == total or current % 25 == 0:
+        print(
+            json.dumps(
+                {"event": "prepare_progress", "current": current, "total": total},
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+
 def _fresh_output(path: Path, *, resume: bool) -> None:
     """Permit only the adapter's independently reusable preparation cache."""
 
@@ -236,6 +249,35 @@ def _record_optional(record: Mapping[str, object] | object, name: str, default: 
 def _pair_id(record: Mapping[str, object] | object) -> str:
     source_id = _record_optional(record, "source_id")
     return str(source_id if source_id is not None else _record_value(record, "pair_id"))
+
+
+def _legacy_protocol_summary(
+    records: Sequence[Mapping[str, object] | object],
+    *,
+    selection: str,
+    threshold: float | None,
+) -> dict[str, object]:
+    floors = sorted(
+        {
+            float(value)
+            for record in records
+            for value in (_record_optional(record, "legacy_tau"),)
+            if value is not None
+        }
+    )
+    return {
+        "event": "input_protocol",
+        "mode": "legacy_tau_censored",
+        "selection": selection,
+        "requested_threshold": threshold,
+        "effective_threshold": (
+            ("cache_floor" if threshold is None else threshold)
+            if selection == "threshold"
+            else None
+        ),
+        "legacy_attention_floor_values": floors,
+        "supports_floor_0_01": bool(floors) and max(floors) <= 0.01,
+    }
 
 
 def _limit_complete_pairs(records: Sequence[Mapping[str, object] | object], limit: int | None) -> list[Mapping[str, object] | object]:
@@ -427,6 +469,17 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, object]:
     if args.require_complete_cache and (not full_coverage or not complete):
         raise ValueError("complete manifest/example coverage with graph and trace artifacts is required")
     selected = _limit_complete_pairs(discovered, args.limit_pairs)
+    print(
+        json.dumps(
+            _legacy_protocol_summary(
+                selected,
+                selection=args.selection,
+                threshold=args.threshold,
+            ),
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     if args.group_by_prompt:
         selected = [
             {
@@ -456,6 +509,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, object]:
         build_device=args.device,
         conversion_chunk_edges=args.conversion_chunk_edges,
         resume=not args.no_prepare_resume,
+        progress_callback=_print_prepare_progress,
     )
     prepared_by_response = {record.response_id: record for record in prepared}
     partitions = {
