@@ -199,6 +199,8 @@ class AttentionGraphDataTests(unittest.TestCase):
                 split="train",
             )
             config = GraphBuildConfig(selection="threshold", threshold=0.05)
+            first_progress: list[tuple[int, int]] = []
+            second_progress: list[tuple[int, int]] = []
 
             first = prepare_graphs(
                 cache_root=root,
@@ -207,6 +209,9 @@ class AttentionGraphDataTests(unittest.TestCase):
                 splits=("train",),
                 build_device="cpu",
                 resume=True,
+                progress_callback=lambda current, total: first_progress.append(
+                    (current, total)
+                ),
             )
             second = prepare_graphs(
                 cache_root=root,
@@ -215,6 +220,9 @@ class AttentionGraphDataTests(unittest.TestCase):
                 splits=("train",),
                 build_device="cpu",
                 resume=True,
+                progress_callback=lambda current, total: second_progress.append(
+                    (current, total)
+                ),
             )
             graph = load_graph(first[0].graph_path, device="cpu")
 
@@ -224,6 +232,8 @@ class AttentionGraphDataTests(unittest.TestCase):
         self.assertEqual(graph.num_channels, 4)
         self.assertEqual(graph.trace_edge_id.shape, graph.trace_channel.shape)
         self.assertEqual(graph.trace_channel.shape, graph.trace_value.shape)
+        self.assertEqual(first_progress, [(1, 1)])
+        self.assertEqual(second_progress, [(1, 1)])
 
     def test_official_partition_holds_test_out_and_groups_train_by_source(self):
         records = []

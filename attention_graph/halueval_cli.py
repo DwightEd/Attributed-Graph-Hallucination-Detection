@@ -134,13 +134,19 @@ def _write_jsonl(path: Path, records: Sequence[Mapping[str, object]]) -> None:
     os.replace(temporary, path)
 
 
-def _print_prepare_progress(current: int, total: int) -> None:
-    """Keep long legacy-cache conversion visibly alive without flooding logs."""
+def _print_pipeline_progress(stage: str, current: int, total: int) -> None:
+    """Keep long preparation/scoring stages visible without flooding logs."""
 
     if current == 1 or current == total or current % 25 == 0:
         print(
             json.dumps(
-                {"event": "prepare_progress", "current": current, "total": total},
+                {
+                    "event": "progress",
+                    "stage": stage,
+                    "current": current,
+                    "total": total,
+                    "percent": round(100.0 * current / total, 1),
+                },
                 sort_keys=True,
             ),
             flush=True,
@@ -454,7 +460,12 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, object]:
     output = args.output_dir.expanduser().resolve()
     _fresh_output(output, resume=not args.no_prepare_resume)
     example_pairs, prompt_groups = _read_examples(args.examples.expanduser())
-    discovered = discover_legacy_halueval_records(args.extraction_dir)
+    discovered = discover_legacy_halueval_records(
+        args.extraction_dir,
+        progress_callback=lambda current, total: _print_pipeline_progress(
+            "legacy_discovery", current, total
+        ),
+    )
     discovered_ids = {str(_record_value(record, "response_id")) for record in discovered}
     if not discovered_ids.issubset(example_pairs):
         raise ValueError("legacy manifest contains response IDs absent from examples")
@@ -509,7 +520,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, object]:
         build_device=args.device,
         conversion_chunk_edges=args.conversion_chunk_edges,
         resume=not args.no_prepare_resume,
-        progress_callback=_print_prepare_progress,
+        progress_callback=_print_pipeline_progress,
     )
     prepared_by_response = {record.response_id: record for record in prepared}
     partitions = {
@@ -541,13 +552,21 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, object]:
         max_support_edges=args.max_support_edges, max_weight_traces=args.max_weight_traces,
         max_distribution_groups=args.max_distribution_groups, decoder_chunk_size=args.decoder_chunk_size, seed=args.seed,
     )
-    training = train_relation_mae(model, train_graphs=train_graphs, validation_graphs=validation_graphs, config=training_config, output_dir=output / "training")
+    training = train_relation_mae(
+        model,
+        train_graphs=train_graphs,
+        validation_graphs=validation_graphs,
+        config=training_config,
+        output_dir=output / "training",
+        progress_callback=_print_pipeline_progress,
+    )
     _write_json(output / "training" / "history.json", training.history)
     predictions, mixture = score_graphs(
         model, fit_graphs=train_graphs, score_graphs=test_graphs, num_views=args.num_score_views,
         include_reconstruction=not args.embedding_only_scoring, max_support_edges=args.max_support_edges,
         max_weight_traces=args.max_weight_traces, max_distribution_groups=args.max_distribution_groups,
         decoder_chunk_size=args.decoder_chunk_size, seed=args.seed,
+        progress_callback=_print_pipeline_progress,
     )
     response_path = output / "test.response_predictions.jsonl"
     _write_jsonl(response_path, predictions)

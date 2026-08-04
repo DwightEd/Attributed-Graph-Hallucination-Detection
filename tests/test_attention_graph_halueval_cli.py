@@ -113,20 +113,38 @@ class HaluEvalAttentionGraphCliParserTests(unittest.TestCase):
 
         self.assertIsNone(summary["effective_threshold"])
 
-    def test_prepare_progress_is_throttled_but_always_reports_start_and_finish(self):
-        from attention_graph.halueval_cli import _print_prepare_progress
+    def test_pipeline_progress_is_staged_throttled_and_reports_start_and_finish(self):
+        from attention_graph.halueval_cli import _print_pipeline_progress
 
         with mock.patch("builtins.print") as printed:
             for current in (1, 2, 25, 49, 50):
-                _print_prepare_progress(current, 50)
+                _print_pipeline_progress("legacy_discovery", current, 50)
 
         payloads = [json.loads(call.args[0]) for call in printed.call_args_list]
         self.assertEqual(
             payloads,
             [
-                {"event": "prepare_progress", "current": 1, "total": 50},
-                {"event": "prepare_progress", "current": 25, "total": 50},
-                {"event": "prepare_progress", "current": 50, "total": 50},
+                {
+                    "event": "progress",
+                    "stage": "legacy_discovery",
+                    "current": 1,
+                    "total": 50,
+                    "percent": 2.0,
+                },
+                {
+                    "event": "progress",
+                    "stage": "legacy_discovery",
+                    "current": 25,
+                    "total": 50,
+                    "percent": 50.0,
+                },
+                {
+                    "event": "progress",
+                    "stage": "legacy_discovery",
+                    "current": 50,
+                    "total": 50,
+                    "percent": 100.0,
+                },
             ],
         )
 

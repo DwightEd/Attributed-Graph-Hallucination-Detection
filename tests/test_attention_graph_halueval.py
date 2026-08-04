@@ -372,13 +372,20 @@ class ManifestAndPairSplitTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            records = discover_legacy_halueval_records(root)
+            progress: list[tuple[int, int]] = []
+            records = discover_legacy_halueval_records(
+                root,
+                progress_callback=lambda current, total: progress.append(
+                    (current, total)
+                ),
+            )
 
         by_id = {_field(record, "response_id"): record for record in records}
         self.assertEqual(set(by_id), {"a", "b"})
         self.assertEqual(_field(by_id["a"], "artifact_status"), "full")
         self.assertEqual(_field(by_id["b"], "artifact_status"), "partial")
         self.assertEqual(_field(by_id["a"], "pair_id"), "pair-1")
+        self.assertEqual(progress, [(1, 2), (2, 2)])
 
     def test_manifest_load_uses_safe_memory_mapped_weights_only_mode(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -556,6 +563,51 @@ class ManifestAndPairSplitTests(unittest.TestCase):
 
 
 class LegacyPreparationIntegrationTests(unittest.TestCase):
+    def test_fresh_preparation_does_not_rescan_growing_cache_for_every_response(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            graph_dir, trace_dir = root / "graphs", root / "traces"
+            graph_dir.mkdir()
+            trace_dir.mkdir()
+            records = []
+            for index in range(4):
+                response_id = f"response-{index}"
+                pair_id = f"pair-{index}"
+                graph_path = graph_dir / f"{response_id}.pt"
+                trace_path = trace_dir / f"{response_id}.pt"
+                torch.save(
+                    _legacy_graph(example_id=response_id, pair_id=pair_id),
+                    graph_path,
+                )
+                torch.save(
+                    _trace_metadata(example_id=response_id, pair_id=pair_id),
+                    trace_path,
+                )
+                records.append(
+                    {
+                        "response_id": response_id,
+                        "pair_id": pair_id,
+                        "graph_path": graph_path,
+                        "trace_path": trace_path,
+                    }
+                )
+
+            original_load = __import__(
+                "attention_graph.halueval", fromlist=["_torch_load"]
+            )._torch_load
+            with mock.patch(
+                "attention_graph.halueval._torch_load", wraps=original_load
+            ) as load:
+                prepare_legacy_halueval_graphs(
+                    records,
+                    output_dir=root / "prepared",
+                    config=GraphBuildConfig(
+                        selection="threshold", threshold=0.05
+                    ),
+                )
+
+            self.assertEqual(load.call_count, 2 * len(records))
+
     def test_preparation_resume_validates_lightweight_identity_before_expensive_conversion(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -723,18 +775,24 @@ class LegacyPreparationIntegrationTests(unittest.TestCase):
                 "graph_path": graph_path,
                 "trace_path": trace_path,
             }
-            progress: list[tuple[int, int]] = []
+            progress: list[tuple[str, int, int]] = []
 
             prepare_legacy_halueval_graphs(
                 [record],
                 output_dir=root / "prepared",
                 config=GraphBuildConfig(selection="threshold", threshold=0.05),
-                progress_callback=lambda current, total: progress.append(
-                    (current, total)
+                progress_callback=lambda stage, current, total: progress.append(
+                    (stage, current, total)
                 ),
             )
 
-            self.assertEqual(progress, [(1, 1)])
+            self.assertEqual(
+                progress,
+                [
+                    ("legacy_cache_conversion", 1, 1),
+                    ("attention_graph_build", 1, 1),
+                ],
+            )
 
 
 class HaluEvalResponseEvaluationTests(unittest.TestCase):

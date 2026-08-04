@@ -321,7 +321,11 @@ def _torch_load(path: Path) -> object:
         return torch.load(path, map_location="cpu", weights_only=True)
 
 
-def discover_legacy_halueval_records(root: str | Path) -> list[dict[str, object]]:
+def discover_legacy_halueval_records(
+    root: str | Path,
+    *,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> list[dict[str, object]]:
     """Discover exactly the graph files named by an extraction manifest."""
 
     root_path = Path(root).expanduser().resolve()
@@ -383,7 +387,10 @@ def discover_legacy_halueval_records(root: str | Path) -> list[dict[str, object]
         normalized_ids.append(identifier)
     records: list[dict[str, object]] = []
     seen_graph_paths: set[Path] = set()
-    for name, expected_response_id in zip(graph_files, normalized_ids):
+    total = len(graph_files)
+    for current, (name, expected_response_id) in enumerate(
+        zip(graph_files, normalized_ids), start=1
+    ):
         graph_path = artifact_path(graph_dir, name)
         if not graph_path.is_file():
             raise ValueError(f"manifest graph file is missing: {graph_path}")
@@ -415,6 +422,8 @@ def discover_legacy_halueval_records(root: str | Path) -> list[dict[str, object]
                 "extraction_fingerprint": graph.get("extraction_fingerprint"),
             }
         )
+        if progress_callback is not None:
+            progress_callback(current, total)
     return records
 
 
@@ -757,20 +766,33 @@ def _formal_cache_identity_from_legacy(
     }
 
 
-def _remove_stale_response_caches(cache_dir: Path, *, response_id: str, keep: Path) -> None:
-    """Migrate pre-identity cache names without retaining stale duplicate responses."""
+def _index_response_caches(cache_dir: Path) -> dict[str, list[Path]]:
+    """Load each existing cache at most once for stale-name migration."""
 
+    indexed: dict[str, list[Path]] = defaultdict(list)
     if not cache_dir.is_dir():
-        return
+        return indexed
     for candidate in cache_dir.glob("attention_*.pt"):
-        if candidate == keep:
-            continue
         try:
             cached = _torch_load(candidate)
         except (OSError, RuntimeError, TypeError, ValueError, KeyError):
             continue
-        if isinstance(cached, Mapping) and str(cached.get("response_id", "")) == response_id:
+        if isinstance(cached, Mapping):
+            response_id = str(cached.get("response_id", "")).strip()
+            if response_id:
+                indexed[response_id].append(candidate)
+    return indexed
+
+
+def _remove_indexed_stale_caches(
+    indexed: dict[str, list[Path]], *, response_id: str, keep: Path
+) -> None:
+    """Remove pre-identity duplicates without rescanning the cache directory."""
+
+    for candidate in indexed.get(response_id, ()):
+        if candidate != keep and candidate.is_file():
             candidate.unlink()
+    indexed[response_id] = [keep] if keep.is_file() else []
 
 
 def prepare_legacy_halueval_graphs(
@@ -784,7 +806,7 @@ def prepare_legacy_halueval_graphs(
     build_device: str | torch.device = "cpu",
     resume: bool = True,
     mmap: bool = True,
-    progress_callback: Callable[[int, int], None] | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> list[PreparedGraphRecord]:
     """Convert complete legacy pairs and prepare standard mmap graph artifacts.
 
@@ -810,6 +832,10 @@ def prepare_legacy_halueval_graphs(
 
     destination = Path(output_dir).expanduser().resolve()
     cache_root = destination / "adapted_cache"
+    cache_index = {
+        split: _index_response_caches(cache_root / split)
+        for split in sorted(set(assignments.values()))
+    }
     total = len(records)
     for current, (record, response_id) in enumerate(
         zip(records, response_ids), start=1
@@ -827,10 +853,12 @@ def prepare_legacy_halueval_graphs(
             legacy_graph, trace, record=record, dataset_split=split
         )
         cache_path = cache_root / split / _legacy_cache_name(record)
-        _remove_stale_response_caches(cache_path.parent, response_id=response_id, keep=cache_path)
+        _remove_indexed_stale_caches(
+            cache_index[split], response_id=response_id, keep=cache_path
+        )
         if resume and cache_path.is_file() and _reusable_formal_cache(cache_path, expected_identity):
             if progress_callback is not None:
-                progress_callback(current, total)
+                progress_callback("legacy_cache_conversion", current, total)
             continue
         formal = legacy_graph_to_formal_attention_cache(
             legacy_graph,
@@ -842,8 +870,9 @@ def prepare_legacy_halueval_graphs(
         if str(formal["response_id"]) != response_id:
             raise ValueError("legacy record and graph response_id identity mismatch")
         _atomic_torch_save(cache_path, formal)
+        cache_index[split][response_id] = [cache_path]
         if progress_callback is not None:
-            progress_callback(current, total)
+            progress_callback("legacy_cache_conversion", current, total)
 
     prepared = data.prepare_graphs(
         cache_root=cache_root,
@@ -853,6 +882,13 @@ def prepare_legacy_halueval_graphs(
         build_device=build_device,
         resume=resume,
         mmap=mmap,
+        progress_callback=(
+            None
+            if progress_callback is None
+            else lambda current, count: progress_callback(
+                "attention_graph_build", current, count
+            )
+        ),
     )
     by_response = {record.response_id: record for record in prepared}
     if set(by_response) != set(response_ids):

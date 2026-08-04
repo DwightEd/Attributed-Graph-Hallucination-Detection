@@ -177,6 +177,7 @@ class AttentionGraphTrainingTests(unittest.TestCase):
     def test_training_runs_real_epochs_updates_parameters_and_writes_checkpoint(self):
         graphs = _graphs(4)
         model = _model()
+        progress: list[tuple[str, int, int]] = []
         before = {
             name: parameter.detach().clone()
             for name, parameter in model.named_parameters()
@@ -196,6 +197,9 @@ class AttentionGraphTrainingTests(unittest.TestCase):
                     seed=41,
                 ),
                 output_dir=Path(directory),
+                progress_callback=lambda stage, current, total: progress.append(
+                    (stage, current, total)
+                ),
             )
             checkpoint = Path(directory) / "encoder.pt"
             self.assertTrue(checkpoint.is_file())
@@ -207,16 +211,37 @@ class AttentionGraphTrainingTests(unittest.TestCase):
             for name, parameter in model.named_parameters()
         )
         self.assertTrue(changed)
+        for epoch in range(1, 4):
+            self.assertEqual(
+                [
+                    (current, total)
+                    for stage, current, total in progress
+                    if stage == f"train_epoch_{epoch}"
+                ],
+                [(1, 3), (2, 3), (3, 3)],
+            )
+            self.assertEqual(
+                [
+                    (current, total)
+                    for stage, current, total in progress
+                    if stage == f"validation_epoch_{epoch}"
+                ],
+                [(1, 1)],
+            )
 
     def test_scoring_returns_graph_embeddings_free_mixture_and_component_energies(self):
         graphs = _graphs(4)
         model = _model()
+        progress: list[tuple[str, int, int]] = []
         scored, mixture = score_graphs(
             model,
             fit_graphs=graphs[:3],
             score_graphs=graphs[3:],
             num_views=2,
             seed=43,
+            progress_callback=lambda stage, current, total: progress.append(
+                (stage, current, total)
+            ),
         )
 
         self.assertEqual(len(scored), 1)
@@ -226,6 +251,15 @@ class AttentionGraphTrainingTests(unittest.TestCase):
         self.assertIn("distribution_energy", scored[0])
         self.assertEqual(len(scored[0]["graph_embedding"]), 12)
         self.assertAlmostEqual(sum(mixture.component_weights), 1.0, places=6)
+        self.assertEqual(
+            progress,
+            [
+                ("mixture_fit", 1, 3),
+                ("mixture_fit", 2, 3),
+                ("mixture_fit", 3, 3),
+                ("test_scoring", 1, 1),
+            ],
+        )
 
     def test_token_mixture_scores_every_response_token_without_rare_class_constraint(self):
         graphs = _graphs(4)

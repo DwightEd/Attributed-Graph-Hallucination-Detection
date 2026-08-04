@@ -7,7 +7,7 @@ import math
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 import numpy as np
 import torch
@@ -178,6 +178,7 @@ def _one_epoch(
     *,
     epoch: int,
     optimizer: torch.optim.Optimizer | None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> dict[str, float]:
     if not graphs:
         raise ValueError("an epoch requires at least one graph")
@@ -217,6 +218,8 @@ def _one_epoch(
                 )
         for name in totals:
             totals[name] += float(getattr(losses, name).detach().cpu())
+        if progress_callback is not None:
+            progress_callback(position + 1, len(graphs))
     return {name: value / len(graphs) for name, value in totals.items()}
 
 
@@ -234,6 +237,7 @@ def train_relation_mae(
     validation_graphs: Sequence[AttentionGraph],
     config: TrainingConfig,
     output_dir: str | Path,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> TrainingResult:
     """Train for real epochs; validation never reads hallucination labels."""
 
@@ -255,10 +259,32 @@ def train_relation_mae(
     stale = 0
     for epoch in range(1, config.epochs + 1):
         train_loss = _one_epoch(
-            model, train_graphs, config, epoch=epoch, optimizer=optimizer
+            model,
+            train_graphs,
+            config,
+            epoch=epoch,
+            optimizer=optimizer,
+            progress_callback=(
+                None
+                if progress_callback is None
+                else lambda current, total: progress_callback(
+                    f"train_epoch_{epoch}", current, total
+                )
+            ),
         )
         validation_loss = _one_epoch(
-            model, validation_graphs, config, epoch=epoch, optimizer=None
+            model,
+            validation_graphs,
+            config,
+            epoch=epoch,
+            optimizer=None,
+            progress_callback=(
+                None
+                if progress_callback is None
+                else lambda current, total: progress_callback(
+                    f"validation_epoch_{epoch}", current, total
+                )
+            ),
         )
         record: dict[str, float | int] = {
             "epoch": epoch,
@@ -481,6 +507,7 @@ def score_graphs(
     max_distribution_groups: int | None = 512,
     decoder_chunk_size: int = 16_384,
     seed: int = 42,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> tuple[list[dict[str, object]], TwoComponentMixture]:
     """Learn two behavior patterns without forcing either one to be rare."""
 
@@ -502,6 +529,8 @@ def score_graphs(
         fit_embeddings.append(embedding)
         fit_energies.append(energy)
         directions.append(structural_direction_anchor(graph)["direction_score"])
+        if progress_callback is not None:
+            progress_callback("mixture_fit", index + 1, len(fit_graphs))
     fit_features = np.asarray(
         [
             (
@@ -578,6 +607,8 @@ def score_graphs(
                 }
             )
         records.append(record)
+        if progress_callback is not None:
+            progress_callback("test_scoring", index + 1, len(score_graphs))
     return records, mixture
 
 

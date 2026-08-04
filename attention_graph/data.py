@@ -12,7 +12,7 @@ import math
 import os
 import random
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -842,13 +842,15 @@ def prepare_graphs(
     build_device: str | torch.device = "cpu",
     resume: bool = True,
     mmap: bool = True,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[PreparedGraphRecord]:
     """Prepare label-free graph files, reusing independently valid artifacts."""
 
     caches = discover_attention_cache(cache_root, splits=splits)
     destination = Path(output_dir).expanduser().resolve()
     records: list[PreparedGraphRecord] = []
-    for cache in caches:
+    total = len(caches)
+    for current, cache in enumerate(caches, start=1):
         # Labels are intentionally not requested and therefore cannot reach the
         # graph builder or persisted artifact.
         sample = load_attention_record(
@@ -890,6 +892,8 @@ def prepare_graphs(
                 state=state,
             )
         )
+        if progress_callback is not None:
+            progress_callback(current, total)
 
     _atomic_json(destination / "index.json", [_index_mapping(record) for record in records])
     return records
