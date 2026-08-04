@@ -253,6 +253,11 @@ def load_attention_sample(
             "response_column_indices": _to_device(loaded["response_column_indices"], device=requested_device),
             "response_values": _to_device(loaded["response_values"], device=requested_device),
         }
+        if "split" in loaded:
+            dataset_split = str(loaded["split"]).strip().casefold()
+            if dataset_split not in {"train", "test"}:
+                raise ValueError("formal RAGTruth split must be train or test")
+            formal["dataset_split"] = dataset_split
         if include_labels and "y_token" in loaded:
             formal["y_token"] = _to_device(loaded["y_token"], device=requested_device)
         return formal

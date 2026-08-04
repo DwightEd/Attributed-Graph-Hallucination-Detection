@@ -183,6 +183,58 @@ def split_paths_by_source(
             for name, source_ids in assignments.items()}
 
 
+def split_paths_by_official_split(
+    records: Sequence[Mapping[str, object]], *, validation_fraction: float, seed: int,
+) -> dict[str, list[Path]]:
+    """Hold out official RAGTruth test and split only official train by source.
+
+    ``dataset_split`` is label-free corpus metadata.  No hallucination label is
+    accepted or inspected here, and all responses sharing one source remain in
+    the same train/validation partition.
+    """
+
+    if not 0.0 < validation_fraction < 1.0:
+        raise ValueError("validation_fraction must be between zero and one")
+    grouped: dict[str, dict[str, list[Path]]] = {"train": {}, "test": {}}
+    for record in records:
+        split = str(record.get("dataset_split", "")).strip().casefold()
+        if split not in grouped:
+            raise ValueError(
+                "official split requires dataset_split=train/test on every compact graph"
+            )
+        source_id = str(record["source_id"])
+        grouped[split].setdefault(source_id, []).append(Path(record["path"]))
+    train_sources, test_sources = set(grouped["train"]), set(grouped["test"])
+    if not test_sources:
+        raise ValueError(
+            "official test cache is absent; compact the cache root containing train/ and test/"
+        )
+    overlap = train_sources.intersection(test_sources)
+    if overlap:
+        raise ValueError(
+            f"source leakage across official train/test splits: {sorted(overlap)[:8]}"
+        )
+    if len(train_sources) < 2:
+        raise ValueError("at least two official-train source groups are required")
+    ordered = sorted(train_sources, key=lambda value: _stable_key(value, seed))
+    validation_count = min(
+        len(ordered) - 1, max(1, round(len(ordered) * validation_fraction))
+    )
+    validation_sources = set(ordered[:validation_count])
+    training_sources = set(ordered[validation_count:])
+    return {
+        "train": sorted(
+            path for source in training_sources for path in grouped["train"][source]
+        ),
+        "validation": sorted(
+            path for source in validation_sources for path in grouped["train"][source]
+        ),
+        "test": sorted(
+            path for source in test_sources for path in grouped["test"][source]
+        ),
+    }
+
+
 def make_answer_mask(
     response_mask: torch.Tensor, graph_ptr: torch.Tensor, *, mask_ratio: float,
     generator: torch.Generator | None = None,
@@ -279,12 +331,19 @@ def atomic_torch_save(path: Path, value: object) -> None:
 
 
 def discover_attention_paths(attention_dir: str | Path, *, limit: int | None = None) -> list[Path]:
-    """Discover one homogeneous, flat raw-cache directory without guessing shards."""
+    """Discover a flat cache or an official root containing train/ and test/."""
 
     root = Path(attention_dir).resolve()
     if not root.is_dir():
         raise NotADirectoryError(f"attention_dir must be an existing directory: {root}")
-    files = sorted(path for path in root.iterdir() if path.is_file() and path.suffix == ".pt")
+    official_dirs = [root / name for name in ("train", "test") if (root / name).is_dir()]
+    roots = official_dirs or [root]
+    files = sorted(
+        path
+        for cache_root in roots
+        for path in cache_root.iterdir()
+        if path.is_file() and path.suffix == ".pt"
+    )
     formal = [path for path in files if path.name.startswith("attention_")]
     legacy = [path for path in files if path.name.startswith("sample_")]
     known = set(formal)
@@ -292,7 +351,7 @@ def discover_attention_paths(attention_dir: str | Path, *, limit: int | None = N
     unknown = [path.name for path in files if path not in known]
     if unknown:
         raise ValueError(
-            "attention_dir contains non-sample .pt files; pass the leaf raw-cache directory: "
+            "attention_dir contains non-sample .pt files: "
             + ", ".join(unknown[:8])
         )
     if formal and legacy:
@@ -303,7 +362,9 @@ def discover_attention_paths(attention_dir: str | Path, *, limit: int | None = N
             raise ValueError("limit must be positive")
         paths = paths[:limit]
     if not paths:
-        raise ValueError(f"no root-level attention_*.pt or sample_*.pt cache files found under {root}")
+        raise ValueError(
+            f"no attention_*.pt or sample_*.pt cache files found under {root}"
+        )
     return paths
 
 
@@ -335,6 +396,7 @@ def _raw_cache_identity(sample: Mapping[str, object], stat: object) -> dict[str,
     return {
         "source_id": str(sample["source_id"]),
         "sample_id": str(sample["sample_id"]),
+        "dataset_split": sample.get("dataset_split"),
         "cache_format": cache_format,
         "attention_cache_fingerprint": fingerprint,
         "cache_dtype": cache_dtype,
@@ -554,6 +616,7 @@ def compact_attention_cache(
         records.append({"path": graph_path.relative_to(destination).as_posix(),
                         "source_file": relative, "source_id": str(graph["source_id"]),
                         "sample_id": str(graph["sample_id"]),
+                        "dataset_split": raw["dataset_split"],
                         "cache_format": str(graph["graph_config"]["cache_format"]),
                         "attention_floor": raw["attention_floor"],
                         "attention_cache_fingerprint": raw["attention_cache_fingerprint"],
@@ -580,6 +643,10 @@ def compact_attention_cache(
     summary: dict[str, object] = {
         "schema_version": "ragtruth_typed_topk_corpus_v3", "state": "complete",
         "samples": len(records), "source_groups": len({record["source_id"] for record in records}),
+        "dataset_split_counts": {
+            name: sum(record["dataset_split"] == name for record in records)
+            for name in ("train", "test")
+        },
         "nodes": sum(int(record["node_count"]) for record in records),
         "edges": sum(int(record["edge_count"]) for record in records),
         "compact_bytes": sum(int(record["bytes"]) for record in records),

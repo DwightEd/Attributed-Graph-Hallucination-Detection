@@ -17,6 +17,7 @@ from unsupervised_token_graph.ragtruth_pipeline import (
     evaluate_token_score_records,
     load_cached_token_labels,
     make_answer_mask,
+    split_paths_by_official_split,
     split_paths_by_source,
 )
 from unsupervised_token_graph.typed_experiment import (
@@ -129,6 +130,44 @@ class SourceGroupedSplitContractTests(unittest.TestCase):
                 source = source_by_path[path]
                 self.assertEqual(partition_by_source.setdefault(source, partition), partition)
 
+    def test_official_split_holds_test_out_and_only_splits_train_for_validation(self):
+        records = [
+            {"path": Path("train_a0.pt"), "source_id": "train-a", "sample_id": "ra0", "dataset_split": "train"},
+            {"path": Path("train_a1.pt"), "source_id": "train-a", "sample_id": "ra1", "dataset_split": "train"},
+            {"path": Path("train_b.pt"), "source_id": "train-b", "sample_id": "rb", "dataset_split": "train"},
+            {"path": Path("train_c.pt"), "source_id": "train-c", "sample_id": "rc", "dataset_split": "train"},
+            {"path": Path("test_d.pt"), "source_id": "test-d", "sample_id": "rd", "dataset_split": "test"},
+        ]
+
+        splits = split_paths_by_official_split(
+            records, validation_fraction=0.34, seed=17
+        )
+
+        self.assertEqual(splits["test"], [Path("test_d.pt")])
+        self.assertEqual(
+            set(splits["train"]) | set(splits["validation"]),
+            {Path("train_a0.pt"), Path("train_a1.pt"), Path("train_b.pt"), Path("train_c.pt")},
+        )
+        self.assertTrue(set(splits["train"]).isdisjoint(splits["validation"]))
+        self.assertTrue(
+            {Path("train_a0.pt"), Path("train_a1.pt")} <= set(splits["train"])
+            or {Path("train_a0.pt"), Path("train_a1.pt")} <= set(splits["validation"])
+        )
+
+    def test_official_split_rejects_missing_test_cache_and_source_leakage(self):
+        train_only = [
+            {"path": Path("a.pt"), "source_id": "a", "sample_id": "ra", "dataset_split": "train"},
+            {"path": Path("b.pt"), "source_id": "b", "sample_id": "rb", "dataset_split": "train"},
+        ]
+        with self.assertRaisesRegex(ValueError, "official.*test|test.*cache"):
+            split_paths_by_official_split(train_only, validation_fraction=0.5, seed=1)
+
+        leaked = train_only + [
+            {"path": Path("a_test.pt"), "source_id": "a", "sample_id": "ra-test", "dataset_split": "test"},
+        ]
+        with self.assertRaisesRegex(ValueError, "source.*train.*test|leak"):
+            split_paths_by_official_split(leaked, validation_fraction=0.5, seed=1)
+
 
 class AttentionDiscoveryContractTests(unittest.TestCase):
     def test_discovery_accepts_one_homogeneous_flat_cache_family(self):
@@ -140,6 +179,21 @@ class AttentionDiscoveryContractTests(unittest.TestCase):
             paths = discover_attention_paths(root)
 
         self.assertEqual([path.name for path in paths], ["attention_000.pt", "attention_001.pt"])
+
+    def test_discovery_accepts_official_train_and_test_cache_directories(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / "train").mkdir()
+            (root / "test").mkdir()
+            (root / "train" / "attention_000.pt").touch()
+            (root / "test" / "attention_001.pt").touch()
+
+            paths = discover_attention_paths(root)
+
+        self.assertEqual(
+            [path.relative_to(root).as_posix() for path in paths],
+            ["test/attention_001.pt", "train/attention_000.pt"],
+        )
 
 
 class AnswerMaskContractTests(unittest.TestCase):

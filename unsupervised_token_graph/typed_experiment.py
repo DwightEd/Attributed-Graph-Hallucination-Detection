@@ -21,6 +21,7 @@ from .ragtruth_data import (
     load_graph_semantic_signature,
     make_answer_mask,
     new_generator,
+    split_paths_by_official_split,
     split_paths_by_source,
 )
 from .typed_model import (
@@ -81,7 +82,7 @@ def train_typed_autoencoder(
     max_nodes: int = 12_000, max_edges: int = 192_000, mask_ratio: float = 0.20,
     neighborhood_weight: float = 0.25, route_weight: float = 0.10,
     train_fraction: float = 0.70, validation_fraction: float = 0.15,
-    amp: str = "bfloat16", seed: int = 42,
+    split_policy: str = "source_random", amp: str = "bfloat16", seed: int = 42,
 ) -> dict[str, object]:
     """Train with label-free validation and persist one concise best checkpoint."""
 
@@ -95,8 +96,17 @@ def train_typed_autoencoder(
     torch.cuda.manual_seed_all(seed)
     records = load_compact_manifest(graph_dir)
     graph_semantic_signature = load_graph_semantic_signature(graph_dir)
-    paths_by_split = split_paths_by_source(records, train_fraction=train_fraction,
-                                           validation_fraction=validation_fraction, seed=seed)
+    if split_policy == "official":
+        paths_by_split = split_paths_by_official_split(
+            records, validation_fraction=validation_fraction, seed=seed
+        )
+    elif split_policy == "source_random":
+        paths_by_split = split_paths_by_source(
+            records, train_fraction=train_fraction,
+            validation_fraction=validation_fraction, seed=seed,
+        )
+    else:
+        raise ValueError("split_policy must be official or source_random")
     record_by_path = {Path(record["path"]): record for record in records}
     training_paths = set(paths_by_split["train"]) | set(paths_by_split["validation"])
     store = CompactGraphStore([record_by_path[path] for path in training_paths],
@@ -197,6 +207,7 @@ def train_typed_autoencoder(
                                   "best_validation_loss": best_validation,
                                   "epochs_ran": len(history),
                                   "graphs": {name: len(paths) for name, paths in paths_by_split.items()},
+                                  "split_policy": split_policy,
                                   "residency": residency, "device": str(requested),
                                   "graph_semantic_signature": graph_semantic_signature}
     atomic_json(output / "training_summary.json", summary)

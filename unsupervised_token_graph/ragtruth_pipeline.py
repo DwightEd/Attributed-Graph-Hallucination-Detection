@@ -12,6 +12,7 @@ from .ragtruth_data import (
     discover_attention_paths,
     load_compact_manifest,
     make_answer_mask,
+    split_paths_by_official_split,
     split_paths_by_source,
     validate_label_free,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "read_score_records",
     "score_graph_strided",
     "score_typed_autoencoder",
+    "split_paths_by_official_split",
     "split_paths_by_source",
     "train_typed_autoencoder",
     "validate_label_free",

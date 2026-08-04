@@ -202,6 +202,7 @@ class SparseAttentionLoaderContractTests(unittest.TestCase):
 
         self.assertEqual(sample["source_id"], "source-42")
         self.assertEqual(sample["sample_id"], "response-19")
+        self.assertEqual(sample["dataset_split"], "train")
         self.assertNotIn("original_idx", sample)
         self.assertTrue(FORBIDDEN_TRAINING_FIELDS.isdisjoint(_keys(sample)))
         for name in (

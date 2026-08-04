@@ -71,6 +71,10 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--train-fraction", type=float, default=0.70)
     train.add_argument("--validation-fraction", type=float, default=0.15)
     train.add_argument(
+        "--split-policy", choices=("official", "source_random"), default="official",
+        help="official holds out RAGTruth test; source_random is legacy exploratory mode",
+    )
+    train.add_argument(
         "--amp", choices=("none", "bfloat16", "float16"), default="bfloat16"
     )
     train.add_argument("--seed", type=int, default=42)
@@ -147,6 +151,7 @@ def main(argv: list[str] | None = None) -> int:
             route_weight=args.route_weight,
             train_fraction=args.train_fraction,
             validation_fraction=args.validation_fraction,
+            split_policy=args.split_policy,
             amp=args.amp,
             seed=args.seed,
         )
