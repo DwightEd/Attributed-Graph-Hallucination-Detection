@@ -23,6 +23,29 @@ class DatasetDownloadShellContractTests(unittest.TestCase):
 
 
 class FeaturePilotShellContractTests(unittest.TestCase):
+    def test_halueval_training_launcher_is_direct_and_uses_2000_candidates(self):
+        script = (
+            REPOSITORY_ROOT / "run_halueval_qa_graph_mae.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            'DATA_ROOT="${DATA_ROOT:-/share/home/tm902089733300000/'
+            'a903202310/lys/data}"',
+            script,
+        )
+        self.assertIn(
+            'MODEL_PATH="${MODEL_PATH:-/share/home/tm902089733300000/'
+            'a903202310/lys/models/Meta-Llama-3.1-8B-Instruct}"',
+            script,
+        )
+        self.assertIn('PILOT_LIMIT="${PILOT_LIMIT:-2000}"', script)
+        self.assertIn('RUN_TRAINING=1', script)
+        self.assertIn('DATASET=halueval_qa', script)
+        self.assertIn('run_unsupervised_token_graph_pilot.sh', script)
+        self.assertNotIn('DATASET=boolq', script)
+        self.assertNotIn('run_dataset boolq', script)
+        self.assertNotIn('download_halueval_boolq.sh', script)
+
     def test_launcher_checks_gpu_and_runs_datasets_sequentially_without_training(self):
         script = (
             REPOSITORY_ROOT / "run_halueval_boolq_feature_pilots.sh"
