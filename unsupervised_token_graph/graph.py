@@ -23,6 +23,7 @@ def build_token_graph(
     tau: float = 0.05,
     include_prefix_edges: bool = True,
     include_logit_node_features: bool = True,
+    pure_attention: bool = False,
 ) -> dict[str, object]:
     """Build a token-node graph using causal attention-threshold edges.
 
@@ -47,19 +48,20 @@ def build_token_graph(
 
     diagonal = values.diagonal(dim1=-2, dim2=-1).to(torch.float32)
     attention_diagonal = diagonal.permute(2, 0, 1).reshape(token_count, -1)
-    segment_one_hot = F.one_hot(segments, num_classes=4).to(torch.float32)
-    denominator = max(token_count - 1, 1)
-    position = torch.arange(
-        token_count, dtype=torch.float32, device=device
-    ).unsqueeze(1)
-    position = position / denominator
     node_views: dict[str, torch.Tensor] = {
         "attention_diagonal": attention_diagonal,
-        "segment_one_hot": segment_one_hot,
-        "position": position,
     }
+    if not pure_attention:
+        node_views["segment_one_hot"] = F.one_hot(
+            segments, num_classes=4
+        ).to(torch.float32)
+        denominator = max(token_count - 1, 1)
+        node_views["position"] = (
+            torch.arange(token_count, dtype=torch.float32, device=device).unsqueeze(1)
+            / denominator
+        )
 
-    if hidden_states is not None:
+    if not pure_attention and hidden_states is not None:
         hidden = _tensor_on(
             hidden_states, device=device, dtype=torch.float32
         )
@@ -68,7 +70,8 @@ def build_token_graph(
         if hidden.shape[0] != token_count:
             raise ValueError("hidden_states must align with input_ids")
         node_views["hidden"] = hidden
-    if include_logit_node_features and token_log_probs is not None:
+    effective_logit_features = bool(include_logit_node_features and not pure_attention)
+    if effective_logit_features and token_log_probs is not None:
         log_probs = _tensor_on(
             token_log_probs, device=device, dtype=torch.float32
         ).reshape(token_count, 1)
@@ -81,7 +84,7 @@ def build_token_graph(
             else torch.isfinite(log_probs).float()
         )
         node_views["token_log_prob_valid"] = valid
-    if include_logit_node_features and next_token_entropy is not None:
+    if effective_logit_features and next_token_entropy is not None:
         entropy = _tensor_on(
             next_token_entropy, device=device, dtype=torch.float32
         ).reshape(token_count, 1)
@@ -130,9 +133,12 @@ def build_token_graph(
     edge_attr = values.permute(2, 3, 0, 1)[target, source]
     edge_attr = edge_attr.reshape(len(source), edge_feature_dim).to(torch.float32)
     edge_attr.masked_fill_(edge_attr <= float(tau), 0.0)
-    source_mark = F.one_hot(segments[source], num_classes=4)
-    target_mark = F.one_hot(segments[target], num_classes=4)
-    edge_mark = torch.cat((source_mark, target_mark), dim=1).float()
+    if pure_attention:
+        edge_mark = torch.empty((len(source), 0), dtype=torch.float32, device=device)
+    else:
+        source_mark = F.one_hot(segments[source], num_classes=4)
+        target_mark = F.one_hot(segments[target], num_classes=4)
+        edge_mark = torch.cat((source_mark, target_mark), dim=1).float()
 
     return {
         "schema_version": "token_graph_v2",
@@ -147,6 +153,7 @@ def build_token_graph(
         "graph_config": {
             "tau": float(tau),
             "include_prefix_edges": bool(include_prefix_edges),
-            "include_logit_node_features": bool(include_logit_node_features),
+            "include_logit_node_features": effective_logit_features,
+            "pure_attention": bool(pure_attention),
         },
     }

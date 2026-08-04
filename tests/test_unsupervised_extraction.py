@@ -61,6 +61,21 @@ class _FakeModel(torch.nn.Module):
 
 
 class SingleTokenizationTests(unittest.TestCase):
+    def test_extraction_cli_can_request_strict_pure_attention_graphs(self):
+        args = build_parser().parse_args(
+            [
+                "--examples",
+                "examples.jsonl",
+                "--model",
+                "model-a",
+                "--output-dir",
+                "output",
+                "--pure-attention",
+            ]
+        )
+
+        self.assertTrue(args.pure_attention)
+
     def test_extraction_cli_can_exclude_logit_node_features(self):
         args = build_parser().parse_args(
             [
@@ -195,6 +210,51 @@ class SingleTokenizationTests(unittest.TestCase):
         )
 
         self.assertNotEqual(with_logits, without_logits)
+
+    def test_cache_fingerprint_changes_for_strict_pure_attention(self):
+        example = compose_example("P", "Q", "A", example_id="sample")
+
+        no_logits = _fingerprint(
+            example,
+            "model-a",
+            (1,),
+            0.05,
+            True,
+            False,
+            include_logit_node_features=False,
+            pure_attention=False,
+        )
+        pure_attention = _fingerprint(
+            example,
+            "model-a",
+            (1,),
+            0.05,
+            True,
+            False,
+            include_logit_node_features=False,
+            pure_attention=True,
+        )
+
+        self.assertNotEqual(no_logits, pure_attention)
+
+    def test_legacy_no_logits_fingerprint_remains_resume_compatible(self):
+        example = compose_example("P", "Q", "A", example_id="sample")
+
+        fingerprint = _fingerprint(
+            example,
+            "model-a",
+            (1,),
+            0.05,
+            True,
+            False,
+            include_logit_node_features=False,
+            pure_attention=False,
+        )
+
+        self.assertEqual(
+            fingerprint,
+            "9f801de9ff8cfb738be488b8bae7aeacaea3f23ccb07f8398fee7bf3d4a8c35e",
+        )
 
     def test_cache_fingerprint_changes_when_extraction_dtype_changes(self):
         example = compose_example("P", "Q", "A", example_id="sample")
@@ -404,6 +464,65 @@ class TraceSummaryTests(unittest.TestCase):
 
 
 class ExtractionCacheIntegrityTests(unittest.TestCase):
+    def test_extraction_writes_a_strict_pure_attention_graph_and_manifest(self):
+        example = compose_example("P", "Q", "A", example_id="sample")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "extraction"
+            manifest = extract_prepared_dataset(
+                _FakeModel(),
+                _FakeTokenizer(example),
+                [example],
+                output_dir=output,
+                model_id="fake-model",
+                selected_hidden_layers=(1,),
+                max_tokens=8,
+                tau=0.05,
+                include_prefix_edges=True,
+                include_hidden_nodes=False,
+                include_logit_node_features=False,
+                pure_attention=True,
+            )
+            graph = torch.load(
+                next((output / "graphs").glob("*.pt")),
+                map_location="cpu",
+                weights_only=True,
+            )
+
+        self.assertTrue(manifest["pure_attention"])
+        self.assertEqual(list(graph["x_view_slices"]), ["attention_diagonal"])
+        self.assertEqual(tuple(graph["edge_mark"].shape), (2, 0))
+        self.assertTrue(graph["graph_config"]["pure_attention"])
+
+    def test_pure_attention_rejects_a_legacy_no_logits_cache(self):
+        example = compose_example("P", "Q", "A", example_id="sample")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            options = {
+                "output_dir": Path(temporary_directory) / "extraction",
+                "model_id": "fake-model",
+                "selected_hidden_layers": (1,),
+                "max_tokens": 8,
+                "tau": 0.05,
+                "include_prefix_edges": True,
+                "include_hidden_nodes": False,
+                "include_logit_node_features": False,
+            }
+            extract_prepared_dataset(
+                _FakeModel(),
+                _FakeTokenizer(example),
+                [example],
+                pure_attention=False,
+                **options,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "Stale extraction cache"):
+                extract_prepared_dataset(
+                    _FakeModel(),
+                    _FakeTokenizer(example),
+                    [example],
+                    pure_attention=True,
+                    **options,
+                )
+
     def test_extraction_excludes_logit_views_and_records_policy(self):
         example = compose_example("P", "Q", "A", example_id="sample")
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -43,6 +43,9 @@ class FeaturePilotShellContractTests(unittest.TestCase):
             'INCLUDE_LOGIT_NODE_FEATURES="${INCLUDE_LOGIT_NODE_FEATURES:-0}"',
             script,
         )
+        self.assertIn('PURE_ATTENTION="${PURE_ATTENTION:-1}"', script)
+        self.assertIn('PURE_ATTENTION="${PURE_ATTENTION}"', script)
+        self.assertIn('NODE_FEATURE_TAG="pure_attention"', script)
         self.assertIn(
             'INCLUDE_LOGIT_NODE_FEATURES="${INCLUDE_LOGIT_NODE_FEATURES}"',
             script,
@@ -115,6 +118,15 @@ class FeaturePilotShellContractTests(unittest.TestCase):
             'GRAPH_NODE_FEATURE_ARGS+=(--exclude-logit-node-features)', script
         )
         self.assertIn('"${GRAPH_NODE_FEATURE_ARGS[@]}"', script)
+
+    def test_dataset_pilot_forwards_strict_pure_attention_protocol(self):
+        script = (
+            REPOSITORY_ROOT / "run_unsupervised_token_graph_pilot.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('PURE_ATTENTION="${PURE_ATTENTION:-0}"', script)
+        self.assertIn('if [[ "${PURE_ATTENTION}" == "1" ]]', script)
+        self.assertIn('GRAPH_NODE_FEATURE_ARGS+=(--pure-attention)', script)
 
     def test_dataset_pilot_forwards_device_and_dtype_to_both_model_loads(self):
         script = (

@@ -41,6 +41,63 @@ class SegmentTraceTests(unittest.TestCase):
 
 
 class TokenGraphConstructionTests(unittest.TestCase):
+    def test_pure_attention_graph_excludes_all_structural_and_logit_features(self):
+        input_ids = torch.tensor([10, 20, 30], dtype=torch.long)
+        segment_ids = torch.tensor([1, 2, 3], dtype=torch.long)
+        attention = torch.zeros((1, 2, 3, 3), dtype=torch.float32)
+        attention[0, :, 0, 0] = torch.tensor([0.11, 0.12])
+        attention[0, :, 1, 1] = torch.tensor([0.21, 0.22])
+        attention[0, :, 2, 2] = torch.tensor([0.31, 0.32])
+        attention[0, :, 2, 0] = torch.tensor([0.20, 0.10])
+
+        graph = build_token_graph(
+            input_ids,
+            attention,
+            segment_ids,
+            hidden_states=torch.ones((1, 3, 4)),
+            token_log_probs=torch.tensor([-0.1, -0.2, -0.3]),
+            next_token_entropy=torch.tensor([1.1, 1.2, 1.3]),
+            token_stat_valid=torch.ones(3, dtype=torch.bool),
+            pure_attention=True,
+        )
+
+        self.assertEqual(list(graph["x_view_slices"]), ["attention_diagonal"])
+        torch.testing.assert_close(
+            graph["x"],
+            attention.diagonal(dim1=-2, dim2=-1).permute(2, 0, 1).reshape(3, 2),
+        )
+        self.assertEqual(tuple(graph["edge_mark"].shape), (1, 0))
+        torch.testing.assert_close(graph["edge_attr"], torch.tensor([[0.20, 0.10]]))
+        self.assertEqual(graph["segment_ids"].tolist(), segment_ids.tolist())
+        self.assertEqual(graph["answer_mask"].tolist(), [False, False, True])
+        self.assertTrue(graph["graph_config"]["pure_attention"])
+        self.assertFalse(graph["graph_config"]["include_logit_node_features"])
+
+    def test_pure_attention_model_inputs_are_invariant_to_prompt_segment_names(self):
+        input_ids = torch.tensor([10, 20, 30], dtype=torch.long)
+        attention = torch.zeros((1, 1, 3, 3), dtype=torch.float32)
+        attention[0, 0, 0, 0] = 0.1
+        attention[0, 0, 1, 1] = 0.2
+        attention[0, 0, 2, 2] = 0.3
+        attention[0, 0, 2, 0] = 0.4
+
+        first = build_token_graph(
+            input_ids,
+            attention,
+            torch.tensor([1, 2, 3]),
+            pure_attention=True,
+        )
+        swapped = build_token_graph(
+            input_ids,
+            attention,
+            torch.tensor([2, 1, 3]),
+            pure_attention=True,
+        )
+
+        for key in ("x", "edge_index", "edge_attr", "edge_mark"):
+            torch.testing.assert_close(first[key], swapped[key])
+        self.assertNotEqual(first["segment_ids"].tolist(), swapped["segment_ids"].tolist())
+
     def test_logit_node_views_can_be_excluded_without_changing_attention_views(self):
         input_ids = torch.tensor([10, 20, 30], dtype=torch.long)
         segment_ids = torch.tensor([1, 2, 3], dtype=torch.long)
@@ -154,6 +211,39 @@ class TokenGraphConstructionTests(unittest.TestCase):
 
 
 class MaskedAutoencoderContractTests(unittest.TestCase):
+    def test_model_trains_with_zero_width_pure_attention_edge_marks(self):
+        graph = build_token_graph(
+            torch.tensor([10, 20, 30]),
+            torch.tensor(
+                [[[[0.1, 0.0, 0.0], [0.2, 0.2, 0.0], [0.3, 0.4, 0.3]]]],
+                dtype=torch.float32,
+            ),
+            torch.tensor([1, 2, 3]),
+            pure_attention=True,
+        )
+        model = TokenGraphMaskedAutoencoder(
+            node_dim=1,
+            edge_dim=1,
+            edge_mark_dim=0,
+            hidden_dim=4,
+            num_layers=1,
+            dropout=0.0,
+        )
+        mask = torch.tensor([False, False, True])
+
+        prediction = model(
+            graph["x"],
+            graph["edge_index"],
+            graph["edge_attr"],
+            graph["edge_mark"],
+            mask,
+        )
+        loss = masked_reconstruction_loss(prediction, graph["x"], mask)
+        loss.backward()
+
+        self.assertEqual(tuple(prediction.shape), tuple(graph["x"].shape))
+        self.assertTrue(any(parameter.grad is not None for parameter in model.parameters()))
+
     def test_answer_block_mask_never_masks_template_passage_or_question(self):
         segment_ids = torch.tensor([0, 1, 1, 2, 2, 3, 3, 3, 3])
 

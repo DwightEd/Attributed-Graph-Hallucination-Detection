@@ -453,6 +453,7 @@ def _build_graph_and_feature_record(
     include_prefix_edges: bool,
     include_hidden_nodes: bool,
     include_logit_node_features: bool,
+    pure_attention: bool = False,
 ) -> tuple[dict[str, object], dict[str, object]]:
     """Share the expensive all-layer max and release summary temporaries first."""
 
@@ -480,6 +481,7 @@ def _build_graph_and_feature_record(
             tau=tau,
             include_prefix_edges=include_prefix_edges,
             include_logit_node_features=include_logit_node_features,
+            pure_attention=pure_attention,
         )
     return graph, feature_record
 
@@ -503,6 +505,7 @@ def _fingerprint(
     include_hidden_nodes: bool,
     *,
     include_logit_node_features: bool = True,
+    pure_attention: bool = False,
     max_tokens: int | None = None,
     model_signature: str | None = None,
     extraction_dtype: str = "unknown",
@@ -510,34 +513,43 @@ def _fingerprint(
     retain_dense_attention: bool = True,
     trace_storage_dtype: str = "float16",
 ) -> str:
-    payload = json.dumps(
-        {
-            "schema": "token_trace_graph_v5",
-            "text": example.text,
-            "model_id": model_id,
-            "model_signature": model_signature or model_id,
-            "layers": list(selected_layers),
-            "tau": tau,
-            "include_prefix_edges": include_prefix_edges,
-            "include_hidden_nodes": include_hidden_nodes,
-            "include_logit_node_features": include_logit_node_features,
-            "max_tokens": max_tokens,
-            "extraction_dtype": extraction_dtype,
-            "postprocess_device": postprocess_device,
-            "retain_dense_attention": retain_dense_attention,
-            "trace_storage_dtype": trace_storage_dtype,
-            "exact_replay": {
-                name: example.metadata.get(name)
-                for name in (
-                    "replay_input_ids",
-                    "replay_attention_mask",
-                    "replay_offset_mapping",
-                    "replay_special_tokens_mask",
-                    "replay_segment_ids",
-                )
-                if name in example.metadata
-            },
+    effective_hidden_nodes = bool(include_hidden_nodes and not pure_attention)
+    effective_logit_node_features = bool(
+        include_logit_node_features and not pure_attention
+    )
+    fingerprint_payload = {
+        "schema": "token_trace_graph_v5",
+        "text": example.text,
+        "model_id": model_id,
+        "model_signature": model_signature or model_id,
+        "layers": list(selected_layers),
+        "tau": tau,
+        "include_prefix_edges": include_prefix_edges,
+        "include_hidden_nodes": effective_hidden_nodes,
+        "include_logit_node_features": effective_logit_node_features,
+        "max_tokens": max_tokens,
+        "extraction_dtype": extraction_dtype,
+        "postprocess_device": postprocess_device,
+        "retain_dense_attention": retain_dense_attention,
+        "trace_storage_dtype": trace_storage_dtype,
+        "exact_replay": {
+            name: example.metadata.get(name)
+            for name in (
+                "replay_input_ids",
+                "replay_attention_mask",
+                "replay_offset_mapping",
+                "replay_special_tokens_mask",
+                "replay_segment_ids",
+            )
+            if name in example.metadata
         },
+    }
+    # Preserve byte-for-byte compatibility with legacy non-pure caches while
+    # giving strict pure-attention artifacts a distinct identity.
+    if pure_attention:
+        fingerprint_payload["pure_attention"] = True
+    payload = json.dumps(
+        fingerprint_payload,
         ensure_ascii=False,
         sort_keys=True,
     )
@@ -605,6 +617,7 @@ def extract_prepared_dataset(
     include_prefix_edges: bool,
     include_hidden_nodes: bool,
     include_logit_node_features: bool = True,
+    pure_attention: bool = False,
     overwrite: bool = False,
     model_signature: str | None = None,
     max_attention_bytes: int | None = None,
@@ -637,6 +650,7 @@ def extract_prepared_dataset(
             include_prefix_edges,
             include_hidden_nodes,
             include_logit_node_features=include_logit_node_features,
+            pure_attention=pure_attention,
             max_tokens=max_tokens,
             model_signature=model_signature,
             extraction_dtype=extraction_dtype,
@@ -719,6 +733,7 @@ def extract_prepared_dataset(
                     include_prefix_edges=include_prefix_edges,
                     include_hidden_nodes=include_hidden_nodes,
                     include_logit_node_features=include_logit_node_features,
+                    pure_attention=pure_attention,
                 )
             except torch.OutOfMemoryError:
                 attention_device = torch.as_tensor(trace["attention"]).device
@@ -736,6 +751,7 @@ def extract_prepared_dataset(
                     include_prefix_edges=include_prefix_edges,
                     include_hidden_nodes=include_hidden_nodes,
                     include_logit_node_features=include_logit_node_features,
+                    pure_attention=pure_attention,
                 )
             trace["feature_record"] = feature_record
             if model_device.type == "cuda":
@@ -808,8 +824,11 @@ def extract_prepared_dataset(
         "max_tokens": max_tokens,
         "tau": tau,
         "include_prefix_edges": include_prefix_edges,
-        "include_hidden_nodes": include_hidden_nodes,
-        "include_logit_node_features": include_logit_node_features,
+        "include_hidden_nodes": bool(include_hidden_nodes and not pure_attention),
+        "include_logit_node_features": bool(
+            include_logit_node_features and not pure_attention
+        ),
+        "pure_attention": bool(pure_attention),
         "max_attention_bytes": max_attention_bytes,
         "extraction_dtype": extraction_dtype,
         "postprocess_device_policy": postprocess_device,
@@ -860,6 +879,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Exclude teacher-forced token log-probability, entropy, and their "
             "validity bits from Graph-MAE node features"
+        ),
+    )
+    parser.add_argument(
+        "--pure-attention",
+        action="store_true",
+        help=(
+            "Use only per-layer/per-head attention diagonals as node features "
+            "and attention values as edge features; segment IDs remain metadata "
+            "for response masking but are not passed to the graph network"
         ),
     )
     parser.add_argument("--limit", type=int)
@@ -920,6 +948,7 @@ def main(argv: list[str] | None = None) -> int:
         include_prefix_edges=not args.drop_prefix_edges,
         include_hidden_nodes=args.include_hidden_nodes,
         include_logit_node_features=not args.exclude_logit_node_features,
+        pure_attention=args.pure_attention,
         overwrite=args.overwrite,
         model_signature=source_signature,
         max_attention_bytes=int(args.max_attention_gib * 1024**3),

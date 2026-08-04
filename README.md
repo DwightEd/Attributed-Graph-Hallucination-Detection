@@ -36,6 +36,24 @@ tests/test_attention_graph_*.py      新方法测试
 旧路径不再是当前方法的依赖。保留它们是为了不破坏已经生成的结果；开发新版方法时
 不应再向其中添加文件，也不要把旧方法的结果与当前方法直接横向比较。
 
+## HaluEval 严格 pure-attention 旧 MAE 基线
+
+`run_halueval_qa_graph_mae.sh` 默认运行旧 `TokenGraphMaskedAutoencoder` 的严格
+pure-attention 协议：节点训练属性只有逐层逐头 self-attention diagonal，边训练属性
+只有逐层逐头 attention。`segment_ids` 只作为持久化元数据用于定位 response 和生成
+mask；segment one-hot、position、hidden state、log-prob、entropy 和 segment edge mark
+都不会进入模型。输出目录带 `graph_mae_pure_attention`，不能加载旧 `no_logits`
+checkpoint。
+
+```bash
+cd /share/home/tm902089733300000/a903202310/lys/research/Attributed-Graph-Hallucination-Detection
+git pull --ff-only origin main
+bash ./run_halueval_qa_graph_mae.sh
+```
+
+pure 模式会跳过旧 Pattern audit，因为该报告仍包含 log-prob/entropy 等非 attention
+诊断量；这不影响无标签 MAE 的训练与最终 test evaluation。
+
 ## 为什么会报 test cache 不存在
 
 给出的 cache 根目录已经有标记为 official split identity 的 `train/`，但没有生成

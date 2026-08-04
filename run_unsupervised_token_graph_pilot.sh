@@ -17,6 +17,7 @@ DTYPE="${DTYPE:-float16}"
 POSTPROCESS_DEVICE="${POSTPROCESS_DEVICE:-auto}"
 RETAIN_DENSE_ATTENTION="${RETAIN_DENSE_ATTENTION:-0}"
 INCLUDE_LOGIT_NODE_FEATURES="${INCLUDE_LOGIT_NODE_FEATURES:-1}"
+PURE_ATTENTION="${PURE_ATTENTION:-0}"
 CPU_THREADS="${CPU_THREADS:-4}"
 
 PREPARED_DIR="${RUN_DIR}/prepared"
@@ -47,6 +48,17 @@ case "${INCLUDE_LOGIT_NODE_FEATURES}" in
     exit 2
     ;;
 esac
+case "${PURE_ATTENTION}" in
+  0|1) ;;
+  *)
+    echo "PURE_ATTENTION must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+if [[ "${PURE_ATTENTION}" == "1" && "${INCLUDE_LOGIT_NODE_FEATURES}" != "0" ]]; then
+  echo "PURE_ATTENTION=1 requires INCLUDE_LOGIT_NODE_FEATURES=0" >&2
+  exit 2
+fi
 if [[ ! "${CPU_THREADS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "CPU_THREADS must be a positive integer" >&2
   exit 2
@@ -67,6 +79,9 @@ fi
 GRAPH_NODE_FEATURE_ARGS=()
 if [[ "${INCLUDE_LOGIT_NODE_FEATURES}" == "0" ]]; then
   GRAPH_NODE_FEATURE_ARGS+=(--exclude-logit-node-features)
+fi
+if [[ "${PURE_ATTENTION}" == "1" ]]; then
+  GRAPH_NODE_FEATURE_ARGS+=(--pure-attention)
 fi
 
 if [[ "${DATASET}" == "halueval_qa" ]]; then
@@ -108,13 +123,17 @@ fi
   "${GRAPH_NODE_FEATURE_ARGS[@]}" \
   "${EXTRACTION_STORAGE_ARGS[@]}"
 
-"${PYTHON_BIN}" -m unsupervised_token_graph.audit \
-  --features "${EXTRACTION_DIR}/features.jsonl" \
-  --evaluation-labels "${PREPARED_DIR}/evaluation_labels.jsonl" \
-  --examples "${PREPARED_DIR}/examples.jsonl" \
-  --output-dir "${AUDIT_DIR}"
+if [[ "${PURE_ATTENTION}" == "1" ]]; then
+  echo "Pattern audit skipped: its scalar feature report includes non-attention diagnostics."
+else
+  "${PYTHON_BIN}" -m unsupervised_token_graph.audit \
+    --features "${EXTRACTION_DIR}/features.jsonl" \
+    --evaluation-labels "${PREPARED_DIR}/evaluation_labels.jsonl" \
+    --examples "${PREPARED_DIR}/examples.jsonl" \
+    --output-dir "${AUDIT_DIR}"
 
-echo "Pattern audit: ${AUDIT_DIR}/pattern_audit.md"
+  echo "Pattern audit: ${AUDIT_DIR}/pattern_audit.md"
+fi
 
 if [[ "${RUN_TRAINING}" == "1" ]]; then
   "${PYTHON_BIN}" -m unsupervised_token_graph.train \

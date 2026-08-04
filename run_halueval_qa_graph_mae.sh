@@ -18,15 +18,33 @@ MAX_TOKENS="${MAX_TOKENS:-1024}"
 MAX_ATTENTION_GIB="${MAX_ATTENTION_GIB:-12}"
 CPU_THREADS="${CPU_THREADS:-4}"
 INCLUDE_LOGIT_NODE_FEATURES="${INCLUDE_LOGIT_NODE_FEATURES:-0}"
+PURE_ATTENTION="${PURE_ATTENTION:-1}"
 
+case "${PURE_ATTENTION}" in
+  0|1) ;;
+  *)
+    echo "PURE_ATTENTION must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
 case "${INCLUDE_LOGIT_NODE_FEATURES}" in
-  0) NODE_FEATURE_TAG="no_logits" ;;
-  1) NODE_FEATURE_TAG="with_logits" ;;
+  0|1) ;;
   *)
     echo "INCLUDE_LOGIT_NODE_FEATURES must be 0 or 1" >&2
     exit 2
     ;;
 esac
+if [[ "${PURE_ATTENTION}" == "1" ]]; then
+  if [[ "${INCLUDE_LOGIT_NODE_FEATURES}" != "0" ]]; then
+    echo "PURE_ATTENTION=1 requires INCLUDE_LOGIT_NODE_FEATURES=0" >&2
+    exit 2
+  fi
+  NODE_FEATURE_TAG="pure_attention"
+elif [[ "${INCLUDE_LOGIT_NODE_FEATURES}" == "0" ]]; then
+  NODE_FEATURE_TAG="no_logits"
+else
+  NODE_FEATURE_TAG="with_logits"
+fi
 RUN_DIR="${RUN_DIR:-${DATA_ROOT}/feature_extraction/halueval_qa_graph_mae_${NODE_FEATURE_TAG}_${PILOT_LIMIT}_$(date -u +%Y%m%dT%H%M%SZ)}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
@@ -54,6 +72,7 @@ echo "candidates=${PILOT_LIMIT}"
 echo "expected_pairs=$((PILOT_LIMIT / 2))"
 echo "expected_test_pairs=$((PILOT_LIMIT / 10))"
 echo "include_logit_node_features=${INCLUDE_LOGIT_NODE_FEATURES}"
+echo "pure_attention=${PURE_ATTENTION}"
 echo "run_dir=${RUN_DIR}"
 
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -77,6 +96,7 @@ env \
   POSTPROCESS_DEVICE=auto \
   RETAIN_DENSE_ATTENTION=0 \
   INCLUDE_LOGIT_NODE_FEATURES="${INCLUDE_LOGIT_NODE_FEATURES}" \
+  PURE_ATTENTION="${PURE_ATTENTION}" \
   CPU_THREADS="${CPU_THREADS}" \
   RUN_TRAINING=1 \
   bash "${SCRIPT_DIR}/run_unsupervised_token_graph_pilot.sh"
