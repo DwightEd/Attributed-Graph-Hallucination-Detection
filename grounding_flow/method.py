@@ -432,11 +432,16 @@ def _build_rewire_plan(
         _lag_bin(target - source, config.lag_boundaries)
         for source, target in zip(source_values, target_values)
     )
-    groups: dict[tuple[int, int], list[int]] = {}
-    for edge_id, (source, lag_bin) in enumerate(zip(source_values, lag_bins)):
+    # Candidate edges only need to share the RR relation.  They do not need
+    # to start in the same lag bin: after exchanging sources, each edge is
+    # checked below against *its own* original bin.  Grouping by the original
+    # bin here incorrectly discarded legal cross-bin swaps before those exact
+    # checks could run.
+    groups: dict[int, list[int]] = {}
+    for edge_id, source in enumerate(source_values):
         source_segment = int(segments[source])
         if source_segment == 3:
-            groups.setdefault((source_segment, lag_bin), []).append(edge_id)
+            groups.setdefault(source_segment, []).append(edge_id)
     eligible = tuple(
         tuple(members) for members in groups.values() if len(members) >= 2
     )

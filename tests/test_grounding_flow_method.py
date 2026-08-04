@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import unittest
 from dataclasses import replace
 from unittest import mock
@@ -106,6 +107,53 @@ def _rewirable_graph():
     return graph, torch.tensor([1, 1, 2, 2, 3, 3, 3, 3], dtype=torch.long)
 
 
+def _cross_bin_rewirable_graph():
+    """RR edges in distinct lag bins that still admit legal cross-bin swaps."""
+
+    layers, heads, tokens, response_idx = 1, 1, 17, 4
+    response_edges = {
+        8: (4, 0.4),  # lag 4 -> bin 0
+        11: (6, 0.4),  # lag 5 -> bin 1
+        16: (7, 0.4),  # lag 9 -> bin 2
+    }
+    rows = [
+        [response_edges[query]] if query in response_edges else [(0, 0.2)]
+        for query in range(response_idx, tokens)
+    ]
+    row_ptr = [0]
+    columns: list[int] = []
+    values: list[float] = []
+    for row in rows:
+        columns.extend(source for source, _ in row)
+        values.extend(value for _, value in row)
+        row_ptr.append(len(columns))
+    diagonal = torch.zeros((layers, heads, tokens), dtype=torch.float32)
+    for query, row in enumerate(rows, start=response_idx):
+        diagonal[0, 0, query] = 1.0 - sum(value for _, value in row)
+    sample = {
+        "attention_cache_schema": "ragtruth-all-layers-all-heads-sparse-response-csr-v1",
+        "num_attention_layers": layers,
+        "num_attention_heads": heads,
+        "attention_diagonal": diagonal,
+        "response_idx": response_idx,
+        "response_row_ptr": torch.tensor(row_ptr),
+        "response_column_indices": torch.tensor(columns),
+        "response_values": torch.tensor(values),
+        "attention_floor": 0.01,
+        "token_ids": torch.arange(tokens),
+        "source_id": "pair-cross-bin",
+        "response_id": "response-cross-bin",
+        "sample_id": "response-cross-bin",
+    }
+    graph = build_attention_graph(
+        sample,
+        GraphBuildConfig(
+            selection="threshold", threshold=0.01, max_edges_per_target=None
+        ),
+    )
+    return graph, torch.tensor([1, 2, 2, 2] + [3] * 13, dtype=torch.long)
+
+
 class EvidenceFlowTests(unittest.TestCase):
     def test_flow_conserves_each_attention_row_and_detects_grounded_relay(self):
         graph, segment_ids = _flow_graph()
@@ -168,6 +216,52 @@ class EvidenceFlowTests(unittest.TestCase):
         before_segments = segment_ids[graph.edge_index[0]]
         after_segments = segment_ids[shuffled.edge_index[0]]
         self.assertTrue(torch.equal(before_segments, after_segments))
+
+    def test_source_rewiring_considers_legal_cross_bin_edge_pairs(self):
+        graph, segment_ids = _cross_bin_rewirable_graph()
+        boundaries = (4, 8)
+
+        shuffled, report = rewire_source_identity(
+            graph,
+            segment_ids,
+            config=NullModelConfig(
+                swaps_per_edge=1, lag_boundaries=boundaries
+            ),
+            generator=torch.Generator().manual_seed(0),
+        )
+
+        self.assertGreater(report.attempts, 0)
+        self.assertGreater(report.accepted_swaps, 0)
+        self.assertFalse(torch.equal(graph.edge_index[0], shuffled.edge_index[0]))
+        self.assertTrue(torch.equal(graph.edge_index[1], shuffled.edge_index[1]))
+        self.assertEqual(
+            sorted(graph.edge_index[0].tolist()),
+            sorted(shuffled.edge_index[0].tolist()),
+        )
+        self.assertTrue(bool((shuffled.edge_index[0] < shuffled.edge_index[1]).all()))
+        for edge_id in range(graph.num_edges):
+            target = int(graph.edge_index[1, edge_id])
+            before_lag = target - int(graph.edge_index[0, edge_id])
+            after_lag = target - int(shuffled.edge_index[0, edge_id])
+            self.assertEqual(
+                bisect.bisect_left(boundaries, before_lag),
+                bisect.bisect_left(boundaries, after_lag),
+            )
+        for field in (
+            "node_attr",
+            "node_context",
+            "response_mask",
+            "edge_type",
+            "edge_score",
+            "trace_edge_id",
+            "trace_channel",
+            "trace_value",
+            "token_ids",
+        ):
+            with self.subTest(field=field):
+                self.assertTrue(
+                    torch.equal(getattr(graph, field), getattr(shuffled, field))
+                )
 
     def test_null_calibration_is_finite_and_keeps_invariant_direct_mass_at_zero(self):
         graph, segment_ids = _rewirable_graph()
