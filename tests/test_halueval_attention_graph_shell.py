@@ -8,6 +8,38 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 class HaluEvalAttentionGraphShellTests(unittest.TestCase):
+    def test_launcher_is_a_zero_argument_entrypoint_pinned_to_local_halueval_cli(self):
+        script = (
+            REPOSITORY_ROOT / "run_halueval_attention_graph.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('if [[ "$#" -ne 0 ]]; then', script)
+        self.assertIn(
+            'Usage: bash ./run_halueval_attention_graph.sh', script
+        )
+        self.assertIn(
+            'export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"',
+            script,
+        )
+        self.assertIn("import attention_graph.halueval_cli as module", script)
+        self.assertIn('attention_graph" / "halueval_cli.py"', script)
+        self.assertIn("Unexpected HaluEval CLI module", script)
+        self.assertIn(
+            "entrypoint=attention_graph.halueval_cli", script
+        )
+        self.assertNotIn("ragtruth_cli", script)
+        self.assertEqual(
+            script.count(
+                '"${PYTHON_BIN}" -m attention_graph.halueval_cli run'
+            ),
+            1,
+        )
+        self.assertIn(
+            'SOURCE_COMPLETION="${SOURCE_RUN}/training/evaluation_only_metrics.json"',
+            script,
+        )
+        self.assertIn("source Graph-MAE run has not completed", script)
+
     def test_launcher_is_foreground_label_free_legacy_compatibility_entrypoint(self):
         script = (
             REPOSITORY_ROOT / "run_halueval_attention_graph.sh"

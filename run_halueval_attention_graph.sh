@@ -4,6 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
+# This launcher is intentionally self-contained.  Edit the defaults below when
+# needed; no positional command-line arguments are accepted.
+if [[ "$#" -ne 0 ]]; then
+  printf 'Usage: bash ./run_halueval_attention_graph.sh\n' >&2
+  exit 2
+fi
+
 PYTHON_BIN="${PYTHON_BIN:-/share/home/tm902089733300000/a903202310/lys/conda_envs/research/bin/python}"
 SOURCE_RUN_FILE="${SOURCE_RUN_FILE:-/share/home/tm902089733300000/a903202310/lys/data/feature_extraction/LATEST_HALUEVAL_GRAPH_MAE_RUN.txt}"
 SOURCE_RUN="${SOURCE_RUN:-}"
@@ -39,9 +46,39 @@ CONVERSION_CHUNK_EDGES="${CONVERSION_CHUNK_EDGES:-8192}"
 # Preserve an explicitly supplied CUDA mask while providing a reproducible default.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  printf 'Python executable does not exist: %s\n' "${PYTHON_BIN}" >&2
+  exit 2
+fi
+
+# Fail before allocating GPU memory if Python resolves an installed/stale
+# package instead of this repository's dedicated HaluEval entrypoint.
+RESOLVED_HALUEVAL_CLI="$("${PYTHON_BIN}" - <<'PY'
+from pathlib import Path
+
+import attention_graph.halueval_cli as module
+
+root = Path.cwd().resolve()
+expected = (root / "attention_graph" / "halueval_cli.py").resolve()
+actual = Path(module.__file__).resolve()
+if actual != expected:
+    raise SystemExit(
+        f"Unexpected HaluEval CLI module: expected {expected}, resolved {actual}"
+    )
+print(actual)
+PY
+)"
 
 if [[ -z "${SOURCE_RUN}" || ! -d "${EXTRACTION_DIR}" ]]; then
   printf 'Legacy HaluEval extraction directory does not exist: %s\n' "${EXTRACTION_DIR}" >&2
+  exit 2
+fi
+SOURCE_COMPLETION="${SOURCE_RUN}/training/evaluation_only_metrics.json"
+if [[ ! -s "${SOURCE_COMPLETION}" ]]; then
+  printf 'The source Graph-MAE run has not completed: %s\n' "${SOURCE_RUN}" >&2
+  printf 'Wait for its evaluation file before starting another GPU job: %s\n' "${SOURCE_COMPLETION}" >&2
   exit 2
 fi
 if [[ ! -s "${EXAMPLES}" ]]; then
@@ -67,6 +104,13 @@ fi
 
 mkdir -p "${OUTPUT_DIR}"
 
+printf 'HaluEval attention-only graph experiment\n'
+printf 'entrypoint=attention_graph.halueval_cli\n'
+printf 'resolved_cli=%s\n' "${RESOLVED_HALUEVAL_CLI}"
+printf 'source_run=%s\n' "${SOURCE_RUN}"
+printf 'output_dir=%s\n' "${OUTPUT_DIR}"
+printf 'gpu=%s device=%s seed=%s epochs=%s selection=%s\n' \
+  "${CUDA_VISIBLE_DEVICES}" "${DEVICE}" "${SEED}" "${EPOCHS}" "${SELECTION}"
 printf 'Warning: legacy tau-censored compatibility; this is not the dense/floor-0.01 protocol.\n' >&2
 
 ARGS=(
