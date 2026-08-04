@@ -70,6 +70,28 @@ class GroundingFlowDataTests(unittest.TestCase):
                             "answer": f"answer {candidate_index}",
                         }
                     )
+            # The extraction run may intentionally contain a 2,000-candidate
+            # cohort while its label-free examples sidecar retains the full
+            # 20,000-candidate HaluEval inventory.  Extra examples are valid
+            # as long as every manifest response is covered.
+            examples.extend(
+                [
+                    {
+                        "example_id": "not-extracted-0",
+                        "pair_id": "not-extracted-pair",
+                        "passage": "unused knowledge",
+                        "question": "unused question",
+                        "answer": "unused candidate 0",
+                    },
+                    {
+                        "example_id": "not-extracted-1",
+                        "pair_id": "not-extracted-pair",
+                        "passage": "unused knowledge",
+                        "question": "unused question",
+                        "answer": "unused candidate 1",
+                    },
+                ]
+            )
             (extraction / "extraction_manifest.json").write_text(
                 json.dumps(
                     {
@@ -124,6 +146,10 @@ class GroundingFlowDataTests(unittest.TestCase):
                 metadata["input_protocol"]["segment_role"],
                 "structural_source_type_only",
             )
+            self.assertTrue(metadata["inventory"]["examples_cover_manifest"])
+            self.assertFalse(
+                metadata["inventory"]["manifest_covers_all_examples"]
+            )
             graph, segments, record = FlowDataset(partitions["train"])[0]
             self.assertTrue(torch.equal(graph.token_ids.cpu(), record.token_ids))
             self.assertEqual(int(torch.nonzero(segments == 3)[0]), graph.response_idx)
@@ -131,6 +157,26 @@ class GroundingFlowDataTests(unittest.TestCase):
             record.token_ids[0] = -1
             with self.assertRaisesRegex(ValueError, "token identity"):
                 FlowDataset([record])[0]
+
+            missing_example_path = root / "examples_missing_manifest_candidate.jsonl"
+            missing_example_path.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in examples
+                    if row["example_id"] != response_ids[0]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "absent from examples"):
+                prepare_halueval_flow_records(
+                    extraction_dir=extraction,
+                    examples_path=missing_example_path,
+                    output_dir=root / "missing-example-rejected",
+                    expected_candidates=6,
+                    require_complete_cache=True,
+                    conversion_device="cpu",
+                )
 
 
 if __name__ == "__main__":

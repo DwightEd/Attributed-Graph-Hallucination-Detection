@@ -94,9 +94,11 @@ sidecar；不会等待旧 Graph-MAE 的 pattern audit 或训练结束，也不�
 `.../feature_extraction/halueval_grounding_flow_<timestamp>_seed<seed>/`，不会再嵌套进旧
 Graph-MAE run，因此数据源和新方法的结果不会混在一起。
 
-正式入口默认 `EXPECTED_CANDIDATES=2000` 且 `REQUIRE_COMPLETE_CACHE=1`；manifest、
-无标签 examples 或图/trace 任一不完整都会直接停止，不会在小样本上静默输出“正式”
-AUROC。如确实只做不完整缓存 pilot，必须显式写明：
+正式入口默认 `EXPECTED_CANDIDATES=2000` 且 `REQUIRE_COMPLETE_CACHE=1`：extraction
+manifest 必须精确包含 2000 个 candidate，每个 candidate 的图/trace 必须完整，无标签
+examples 必须覆盖这些 response ID 与 pair ID。examples sidecar 可以是包含 20000 条的
+全量超集，不要求它与本次提取 cohort 等长。这样既不会误拒绝合法的 2000 子集，也不会
+在真实的小样本 manifest 上静默输出“正式”AUROC。如确实只做不完整缓存 pilot，必须显式写明：
 
 ```bash
 EXPECTED_CANDIDATES=none REQUIRE_COMPLETE_CACHE=0 LIMIT_PAIRS=50 \

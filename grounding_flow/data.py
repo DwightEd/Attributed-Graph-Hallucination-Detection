@@ -227,11 +227,11 @@ def prepare_halueval_flow_records(
     if expected_candidates is not None:
         if expected_candidates < 1:
             raise ValueError("expected_candidates must be positive or None")
-        if len(example_pairs) != expected_candidates or len(discovered_ids) != expected_candidates:
+        if len(discovered_ids) != expected_candidates:
             raise ValueError(
-                "expected candidate count does not match examples/manifest: "
-                f"expected={expected_candidates} examples={len(example_pairs)} "
-                f"manifest={len(discovered_ids)}"
+                "expected candidate count does not match extraction manifest: "
+                f"expected={expected_candidates} manifest={len(discovered_ids)} "
+                f"examples_available={len(example_pairs)}"
             )
     if not discovered_ids.issubset(example_pairs):
         raise ValueError("legacy manifest contains responses absent from examples")
@@ -241,10 +241,14 @@ def prepare_halueval_flow_records(
         for record in discovered
     ):
         raise ValueError("legacy manifest pair identity disagrees with examples")
-    full_coverage = discovered_ids == set(example_pairs)
+    examples_cover_manifest = discovered_ids.issubset(example_pairs)
+    manifest_covers_all_examples = discovered_ids == set(example_pairs)
     complete = all(str(_value(record, "artifact_status")) == "full" for record in discovered)
-    if require_complete_cache and (not full_coverage or not complete):
-        raise ValueError("complete manifest/example graph-and-trace coverage is required")
+    if require_complete_cache and (not examples_cover_manifest or not complete):
+        raise ValueError(
+            "complete graph-and-trace artifacts and example coverage are required "
+            "for every manifest candidate"
+        )
     selected = _complete_pair_selection(discovered, limit_pairs)
     split_input: list[Mapping[str, object] | object]
     if group_by_prompt:
@@ -321,7 +325,7 @@ def prepare_halueval_flow_records(
         "schema": "halueval-grounding-flow-prepared-v1",
         "scope": (
             "legacy_cache_complete"
-            if complete and full_coverage and limit_pairs is None
+            if complete and examples_cover_manifest and limit_pairs is None
             else "legacy_cache_partial_pilot"
         ),
         "counts": {name: len(records) for name, records in result.items()},
@@ -330,7 +334,8 @@ def prepare_halueval_flow_records(
             "example_candidates": len(example_pairs),
             "manifest_candidates": len(discovered_ids),
             "selected_candidates": len(selected),
-            "full_example_coverage": full_coverage,
+            "examples_cover_manifest": examples_cover_manifest,
+            "manifest_covers_all_examples": manifest_covers_all_examples,
             "all_artifacts_full": complete,
         },
         "pair_ids": {
