@@ -14,8 +14,8 @@ class OfficialRunnerContractTests(unittest.TestCase):
         text = (ROOT / "run_ragtruth_typed_token_graph.sh").read_text(encoding="utf-8")
 
         self.assertIn("fresh_attention_c8847872bedf_20260731T074520Z_p876}", text)
-        self.assertIn("for split in train test", text)
-        self.assertIn('split_dir="${ATTENTION_DIR}/${split}"', text)
+        self.assertIn('"${ATTENTION_DIR}/train/attention_*.pt"', text)
+        self.assertIn('"${ATTENTION_DIR}/test/attention_*.pt"', text)
         self.assertIn("--split-policy official", text)
         self.assertIn("ragtruth_cli sentences", text)
         self.assertIn("--sentence-scores", text)
@@ -31,6 +31,21 @@ class OfficialRunnerContractTests(unittest.TestCase):
         self.assertIn("ln -s", text)
         self.assertNotIn("cp -r", text)
         self.assertNotIn("mv ", text)
+
+    def test_missing_official_test_cache_is_prepared_without_reextracting_train(self):
+        runner = (ROOT / "run_ragtruth_typed_token_graph.sh").read_text(
+            encoding="utf-8"
+        )
+        preparer = (
+            ROOT / "scripts" / "data" / "prepare_ragtruth_test_attention.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("prepare_ragtruth_test_attention.sh", runner)
+        self.assertIn('AUTO_PREPARE_TEST_ATTENTION="${AUTO_PREPARE_TEST_ATTENTION:-1}"', runner)
+        self.assertIn("--split test", preparer)
+        self.assertIn("--resume-existing", preparer)
+        self.assertNotIn("--split train", preparer)
+        self.assertIn('"${ATTENTION_DIR}/test"', preparer)
 
 
 if __name__ == "__main__":

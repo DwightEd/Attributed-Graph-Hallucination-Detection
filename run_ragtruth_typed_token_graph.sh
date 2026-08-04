@@ -29,6 +29,7 @@ AMP="${AMP:-bfloat16}"
 LABEL_SHIFT="${LABEL_SHIFT:-0}"
 RUN_EVALUATION="${RUN_EVALUATION:-1}"
 REGISTER_HYPERGRAPH_RESULT="${REGISTER_HYPERGRAPH_RESULT:-1}"
+AUTO_PREPARE_TEST_ATTENTION="${AUTO_PREPARE_TEST_ATTENTION:-1}"
 VALIDATION_FRACTION="${VALIDATION_FRACTION:-0.15}"
 EPOCHS="${EPOCHS:-40}"
 PATIENCE="${PATIENCE:-6}"
@@ -53,15 +54,25 @@ for required_file in "${RESPONSES}" "${SOURCES}" "${TOKENIZER}/config.json"; do
     exit 1
   fi
 done
-for split in train test; do
-  split_dir="${ATTENTION_DIR}/${split}"
-  if [[ ! -d "${split_dir}" ]] || ! compgen -G "${split_dir}/attention_*.pt" >/dev/null; then
-    printf 'Official RAGTruth %s attention cache is absent: %s\n' "${split}" "${split_dir}" >&2
-    printf 'Complete/resume both splits first from the hypergraph project:\n' >&2
-    printf '  ATTENTION_CACHE_ROOT=%q RESUME_EXTRACTION=1 bash run_ragtruth_extract_validate.sh\n' "${ATTENTION_DIR}" >&2
+if [[ ! -d "${ATTENTION_DIR}/train" ]] || ! compgen -G "${ATTENTION_DIR}/train/attention_*.pt" >/dev/null; then
+  printf 'Official RAGTruth train attention cache is absent: %s\n' "${ATTENTION_DIR}/train" >&2
+  exit 1
+fi
+if [[ ! -d "${ATTENTION_DIR}/test" ]] || ! compgen -G "${ATTENTION_DIR}/test/attention_*.pt" >/dev/null; then
+  if [[ "${AUTO_PREPARE_TEST_ATTENTION}" != "1" ]]; then
+    printf 'Official RAGTruth test attention cache is absent: %s\n' "${ATTENTION_DIR}/test" >&2
+    printf 'Rerun with AUTO_PREPARE_TEST_ATTENTION=1 to extract only official test.\n' >&2
     exit 1
   fi
-done
+  DATA_ROOT="${DATA_ROOT}" \
+  FEATURE_ROOT="${FEATURE_ROOT}" \
+  DATASET_DIR="${DATASET_DIR}" \
+  TOKENIZER="${TOKENIZER}" \
+  ATTENTION_DIR="${ATTENTION_DIR}" \
+  DEVICE="${DEVICE}" \
+  PYTHON_BIN="${PYTHON_BIN}" \
+  bash "${SCRIPT_DIR}/scripts/data/prepare_ragtruth_test_attention.sh"
+fi
 
 mkdir -p "${FEATURE_ROOT}" "${RUN_DIR}"
 if [[ "${REGISTER_HYPERGRAPH_RESULT}" == "1" ]]; then

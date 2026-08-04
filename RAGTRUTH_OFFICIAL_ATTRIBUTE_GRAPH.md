@@ -59,14 +59,16 @@ bash ./run_ragtruth_typed_token_graph.sh
 bash ./register_ragtruth_hypergraph_result.sh
 ```
 
-如果正式 cache 的 `test/` 尚未提取，主脚本会停止并打印恢复命令。在超图项目中运行：
+如果正式 cache 的 `test/` 尚未提取，主脚本默认调用
+`scripts/data/prepare_ragtruth_test_attention.sh`，只补提取官方 test，不重新提取已有
+train，然后自动继续属性图实验。仍然执行同一条命令即可：
 
 ```bash
-cd /share/home/tm902089733300000/a903202310/lys/research/Unsupervised-hypergraph
-ATTENTION_CACHE_ROOT=/share/home/tm902089733300000/a903202310/lys/research/Unsupervised-hypergraph/outputs/attention_cache/fresh_attention_c8847872bedf_20260731T074520Z_p876 \
-RESUME_EXTRACTION=1 \
-bash ./run_ragtruth_extract_validate.sh
+bash ./run_ragtruth_typed_token_graph.sh
 ```
+
+若只想检查、不允许脚本自动启动耗时的 test attention 提取，可设置
+`AUTO_PREPARE_TEST_ATTENTION=0`。
 
 显存无法容纳全部紧凑图时，显式使用流式 GPU 训练：
 
