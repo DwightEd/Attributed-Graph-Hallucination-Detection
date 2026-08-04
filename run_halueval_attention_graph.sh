@@ -75,11 +75,15 @@ if [[ -z "${SOURCE_RUN}" || ! -d "${EXTRACTION_DIR}" ]]; then
   printf 'Legacy HaluEval extraction directory does not exist: %s\n' "${EXTRACTION_DIR}" >&2
   exit 2
 fi
+EXTRACTION_MANIFEST="${EXTRACTION_DIR}/extraction_manifest.json"
+if [[ ! -s "${EXTRACTION_MANIFEST}" ]] || \
+   ! grep -Eq '"state"[[:space:]]*:[[:space:]]*"complete"' "${EXTRACTION_MANIFEST}"; then
+  printf 'The source attention extraction is not complete: %s\n' "${EXTRACTION_MANIFEST}" >&2
+  exit 2
+fi
 SOURCE_COMPLETION="${SOURCE_RUN}/training/evaluation_only_metrics.json"
 if [[ ! -s "${SOURCE_COMPLETION}" ]]; then
-  printf 'The source Graph-MAE run has not completed: %s\n' "${SOURCE_RUN}" >&2
-  printf 'Wait for its evaluation file before starting another GPU job: %s\n' "${SOURCE_COMPLETION}" >&2
-  exit 2
+  printf 'Warning: source Graph-MAE training is still running; the jobs use separate output files but may contend for GPU memory and compute.\n' >&2
 fi
 if [[ ! -s "${EXAMPLES}" ]]; then
   printf 'Label-free examples file does not exist: %s\n' "${EXAMPLES}" >&2

@@ -1,6 +1,10 @@
 """Contract tests for the legacy HaluEval attention-graph launcher."""
 
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import tempfile
 import unittest
 
 
@@ -8,6 +12,67 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 class HaluEvalAttentionGraphShellTests(unittest.TestCase):
+    def test_completed_extraction_can_start_while_source_training_is_running(self):
+        bash = shutil.which("bash")
+        git_bash = Path("C:/Program Files/Git/bin/bash.exe")
+        if bash is None and git_bash.is_file():
+            bash = str(git_bash)
+        if bash is None:
+            self.skipTest("bash is required for the launcher behavior test")
+
+        with tempfile.TemporaryDirectory(dir=REPOSITORY_ROOT) as temporary_directory:
+            source_run = Path(temporary_directory)
+            (source_run / "extraction").mkdir()
+            (source_run / "prepared").mkdir()
+            (source_run / "training").mkdir()
+            (source_run / "extraction" / "extraction_manifest.json").write_text(
+                '{"state": "complete"}\n', encoding="utf-8"
+            )
+            (source_run / "prepared" / "examples.jsonl").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            (source_run / "prepared" / "evaluation_labels.jsonl").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            captured_arguments = source_run / "captured-arguments.txt"
+            fake_python = source_run / "fake-python"
+            fake_python.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"$#\" -eq 0 ]]; then\n"
+                "  printf '%s\\n' \"$PWD/attention_graph/halueval_cli.py\"\n"
+                "  exit 0\n"
+                "fi\n"
+                "printf '%s\\n' \"$@\" > \"${CAPTURE_ARGUMENTS}\"\n",
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            relative_source = source_run.relative_to(REPOSITORY_ROOT).as_posix()
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PYTHON_BIN": f"{relative_source}/fake-python",
+                    "SOURCE_RUN": relative_source,
+                    "RUN_TAG": "concurrent-source-test",
+                    "CAPTURE_ARGUMENTS": (
+                        f"{relative_source}/captured-arguments.txt"
+                    ),
+                }
+            )
+
+            completed = subprocess.run(
+                [bash, "./run_halueval_attention_graph.sh"],
+                cwd=REPOSITORY_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            arguments = captured_arguments.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(arguments[:3], ["-m", "attention_graph.halueval_cli", "run"])
+            self.assertNotIn("ragtruth_cli", "\n".join(arguments))
+
     def test_launcher_is_a_zero_argument_entrypoint_pinned_to_local_halueval_cli(self):
         script = (
             REPOSITORY_ROOT / "run_halueval_attention_graph.sh"
@@ -35,10 +100,12 @@ class HaluEvalAttentionGraphShellTests(unittest.TestCase):
             1,
         )
         self.assertIn(
-            'SOURCE_COMPLETION="${SOURCE_RUN}/training/evaluation_only_metrics.json"',
+            'EXTRACTION_MANIFEST="${EXTRACTION_DIR}/extraction_manifest.json"',
             script,
         )
-        self.assertIn("source Graph-MAE run has not completed", script)
+        self.assertIn("source attention extraction is not complete", script)
+        self.assertIn("source Graph-MAE training is still running", script)
+        self.assertNotIn("Wait for its evaluation file", script)
 
     def test_launcher_is_foreground_label_free_legacy_compatibility_entrypoint(self):
         script = (
