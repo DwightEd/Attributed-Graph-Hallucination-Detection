@@ -360,7 +360,14 @@ def discover_attention_paths(attention_dir: str | Path, *, limit: int | None = N
     if limit is not None:
         if limit < 1:
             raise ValueError("limit must be positive")
-        paths = paths[:limit]
+        if official_dirs:
+            paths = sorted(
+                path
+                for cache_root in official_dirs
+                for path in [item for item in paths if item.parent == cache_root][:limit]
+            )
+        else:
+            paths = paths[:limit]
     if not paths:
         raise ValueError(
             f"no attention_*.pt or sample_*.pt cache files found under {root}"
@@ -548,11 +555,7 @@ def compact_attention_cache(
     source_root, destination = Path(attention_dir).resolve(), Path(output_dir).resolve()
     if source_root == destination or source_root in destination.parents or destination in source_root.parents:
         raise ValueError("attention_dir and output_dir must not be equal or nested")
-    paths = discover_attention_paths(source_root)
-    if limit is not None:
-        if limit < 1:
-            raise ValueError("limit must be positive")
-        paths = paths[:limit]
+    paths = discover_attention_paths(source_root, limit=limit)
     metadata = _preflight_attention_samples(paths)
     graph_dir = destination / "graphs"
     graph_dir.mkdir(parents=True, exist_ok=True)

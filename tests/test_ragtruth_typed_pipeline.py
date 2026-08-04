@@ -186,9 +186,11 @@ class AttentionDiscoveryContractTests(unittest.TestCase):
             (root / "train").mkdir()
             (root / "test").mkdir()
             (root / "train" / "attention_000.pt").touch()
+            (root / "train" / "attention_002.pt").touch()
             (root / "test" / "attention_001.pt").touch()
+            (root / "test" / "attention_003.pt").touch()
 
-            paths = discover_attention_paths(root)
+            paths = discover_attention_paths(root, limit=1)
 
         self.assertEqual(
             [path.relative_to(root).as_posix() for path in paths],

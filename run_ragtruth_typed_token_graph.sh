@@ -4,9 +4,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
-ATTENTION_DIR="${ATTENTION_DIR:-/share/home/tm902089733300000/a903202310/lys/research/Unsupervised-hypergraph/outputs/attention_cache/fresh_attention_c8847872bedf_20260731T074520Z_p876/train}"
-RUN_DIR="${RUN_DIR:-${SCRIPT_DIR}/outputs/ragtruth_typed_token_graph/fresh_attention_c8847872bedf}"
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+  PYTHON_BIN="$(command -v python || command -v python3)"
+fi
+DATA_ROOT="${DATA_ROOT:-/share/home/tm902089733300000/a903202310/lys/data}"
+FEATURE_ROOT="${FEATURE_ROOT:-${DATA_ROOT}/feature_extraction}"
+DATASET_DIR="${DATASET_DIR:-${DATA_ROOT}/RAGTruth/dataset}"
+RESPONSES="${RESPONSES:-${DATASET_DIR}/response.jsonl}"
+SOURCES="${SOURCES:-${DATASET_DIR}/source_info.jsonl}"
+TOKENIZER="${TOKENIZER:-/share/home/tm902089733300000/a903202310/lys/models/Meta-Llama-3.1-8B-Instruct}"
+ATTENTION_DIR="${ATTENTION_DIR:-/share/home/tm902089733300000/a903202310/lys/research/Unsupervised-hypergraph/outputs/attention_cache/fresh_attention_c8847872bedf_20260731T074520Z_p876}"
+RUN_DIR="${RUN_DIR:-${FEATURE_ROOT}/ragtruth_attribute_graph_typed_mae_fresh_attention_c8847872bedf_official}"
 DEVICE="${DEVICE:-cuda:0}"
 RESIDENCY="${RESIDENCY:-cuda}"
 MAX_RESIDENT_GIB="${MAX_RESIDENT_GIB:-0}"
@@ -20,11 +28,17 @@ MASK_STRIDE="${MASK_STRIDE:-8}"
 AMP="${AMP:-bfloat16}"
 LABEL_SHIFT="${LABEL_SHIFT:-0}"
 RUN_EVALUATION="${RUN_EVALUATION:-1}"
+REGISTER_HYPERGRAPH_RESULT="${REGISTER_HYPERGRAPH_RESULT:-1}"
+VALIDATION_FRACTION="${VALIDATION_FRACTION:-0.15}"
+EPOCHS="${EPOCHS:-40}"
+PATIENCE="${PATIENCE:-6}"
+SEED="${SEED:-42}"
 LIMIT="${LIMIT:-}"
 
 GRAPH_DIR="${RUN_DIR}/compact_graphs"
 TRAIN_DIR="${RUN_DIR}/training"
 SCORE_FILE="${RUN_DIR}/test_token_scores.jsonl"
+SENTENCE_SCORE_FILE="${RUN_DIR}/test_sentence_scores.jsonl"
 METRIC_FILE="${RUN_DIR}/test_metrics.json"
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
@@ -32,6 +46,29 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-2}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-2}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export AMP
+
+for required_file in "${RESPONSES}" "${SOURCES}" "${TOKENIZER}/config.json"; do
+  if [[ ! -f "${required_file}" ]]; then
+    printf 'Missing required input: %s\n' "${required_file}" >&2
+    exit 1
+  fi
+done
+for split in train test; do
+  split_dir="${ATTENTION_DIR}/${split}"
+  if [[ ! -d "${split_dir}" ]] || ! compgen -G "${split_dir}/attention_*.pt" >/dev/null; then
+    printf 'Official RAGTruth %s attention cache is absent: %s\n' "${split}" "${split_dir}" >&2
+    printf 'Complete/resume both splits first from the hypergraph project:\n' >&2
+    printf '  ATTENTION_CACHE_ROOT=%q RESUME_EXTRACTION=1 bash run_ragtruth_extract_validate.sh\n' "${ATTENTION_DIR}" >&2
+    exit 1
+  fi
+done
+
+mkdir -p "${FEATURE_ROOT}" "${RUN_DIR}"
+if [[ "${REGISTER_HYPERGRAPH_RESULT}" == "1" ]]; then
+  if ! FEATURE_ROOT="${FEATURE_ROOT}" bash "${SCRIPT_DIR}/register_ragtruth_hypergraph_result.sh"; then
+    printf 'Warning: historical hypergraph result was not registered; attribute-graph run continues.\n' >&2
+  fi
+fi
 
 "${PYTHON_BIN}" - <<'PY'
 import sys
@@ -49,8 +86,6 @@ print("sklearn:", sklearn.__version__)
 if os.environ["AMP"] == "bfloat16" and not torch.cuda.is_bf16_supported():
     raise RuntimeError("GPU does not support bfloat16; rerun with AMP=float16")
 PY
-
-mkdir -p "${RUN_DIR}"
 
 COMPACT_ARGS=()
 if [[ -n "${LIMIT}" ]]; then
@@ -77,13 +112,16 @@ fi
   --max-resident-gib "${MAX_RESIDENT_GIB}" \
   --hidden-dim 192 \
   --num-layers 2 \
-  --epochs 40 \
-  --patience 6 \
+  --epochs "${EPOCHS}" \
+  --patience "${PATIENCE}" \
   --max-nodes "${MAX_NODES}" \
   --max-edges "${MAX_EDGES}" \
   --mask-ratio 0.20 \
   --neighborhood-weight 0.25 \
   --route-weight 0.10 \
+  --split-policy official \
+  --validation-fraction "${VALIDATION_FRACTION}" \
+  --seed "${SEED}" \
   --amp "${AMP}"
 
 "${PYTHON_BIN}" -m unsupervised_token_graph.ragtruth_cli score \
@@ -98,11 +136,22 @@ fi
   --mask-stride "${MASK_STRIDE}" \
   --amp "${AMP}"
 
+"${PYTHON_BIN}" -m unsupervised_token_graph.ragtruth_cli sentences \
+  --scores "${SCORE_FILE}" \
+  --attention-dir "${ATTENTION_DIR}" \
+  --graph-dir "${GRAPH_DIR}" \
+  --responses "${RESPONSES}" \
+  --sources "${SOURCES}" \
+  --tokenizer "${TOKENIZER}" \
+  --top-fraction 0.20 \
+  --output "${SENTENCE_SCORE_FILE}"
+
 if [[ "${RUN_EVALUATION}" == "1" ]]; then
   "${PYTHON_BIN}" -m unsupervised_token_graph.ragtruth_cli evaluate \
     --scores "${SCORE_FILE}" \
     --attention-dir "${ATTENTION_DIR}" \
     --graph-dir "${GRAPH_DIR}" \
+    --sentence-scores "${SENTENCE_SCORE_FILE}" \
     --output "${METRIC_FILE}" \
     --label-shift "${LABEL_SHIFT}"
 fi
@@ -110,6 +159,7 @@ fi
 echo "compact graphs: ${GRAPH_DIR}"
 echo "checkpoint: ${TRAIN_DIR}/best.pt"
 echo "token scores: ${SCORE_FILE}"
+echo "sentence scores: ${SENTENCE_SCORE_FILE}"
 if [[ "${RUN_EVALUATION}" == "1" ]]; then
   echo "metrics: ${METRIC_FILE}"
 fi
