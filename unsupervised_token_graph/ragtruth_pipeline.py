@@ -27,6 +27,12 @@ from .typed_experiment import (
     score_typed_autoencoder,
     train_typed_autoencoder,
 )
+from .ragtruth_sentences import (
+    aggregate_sentence_token_scores,
+    evaluate_sentence_score_records,
+    sentence_char_spans,
+    write_sentence_score_file,
+)
 
 __all__ = [
     "CompactGraphStore",
@@ -35,14 +41,18 @@ __all__ = [
     "discover_attention_paths",
     "evaluate_score_file",
     "evaluate_token_score_records",
+    "evaluate_sentence_score_records",
     "load_cached_token_labels",
     "load_compact_manifest",
     "make_answer_mask",
     "read_score_records",
     "score_graph_strided",
     "score_typed_autoencoder",
+    "sentence_char_spans",
     "split_paths_by_official_split",
     "split_paths_by_source",
     "train_typed_autoencoder",
     "validate_label_free",
+    "aggregate_sentence_token_scores",
+    "write_sentence_score_file",
 ]

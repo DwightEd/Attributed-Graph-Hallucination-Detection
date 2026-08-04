@@ -200,6 +200,7 @@ def load_cached_token_labels(
 def evaluate_score_file(
     score_path: str | Path, attention_dir: str | Path, output_path: str | Path, *,
     label_shift: int = 0, graph_dir: str | Path | None = None,
+    sentence_score_path: str | Path | None = None,
 ) -> dict[str, object]:
     """Evaluate frozen scores; the sole label-reading experiment stage."""
 
@@ -268,5 +269,13 @@ def evaluate_score_file(
                        "auprc": auprc, "auprc_lift": auprc / prevalence},
         "components": components, "alignment": alignment, "score_file": str(score_path),
     }
+    if sentence_score_path is not None:
+        from .ragtruth_sentences import evaluate_sentence_score_records
+
+        sentence_records = read_score_records(sentence_score_path)
+        report["sentence"] = evaluate_sentence_score_records(
+            sentence_records, token_labels
+        )
+        report["sentence_score_file"] = str(sentence_score_path)
     atomic_json(Path(output_path), report)
     return report

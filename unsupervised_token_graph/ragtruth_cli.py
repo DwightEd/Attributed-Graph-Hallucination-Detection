@@ -10,6 +10,7 @@ from .ragtruth_pipeline import (
     evaluate_score_file,
     score_typed_autoencoder,
     train_typed_autoencoder,
+    write_sentence_score_file,
 )
 
 
@@ -95,6 +96,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--amp", choices=("none", "bfloat16", "float16"), default="bfloat16"
     )
 
+    sentence = commands.add_parser(
+        "sentences", help="pool frozen token scores into label-free sentence scores"
+    )
+    sentence.add_argument("--scores", required=True)
+    sentence.add_argument("--attention-dir", required=True)
+    sentence.add_argument("--graph-dir", required=True)
+    sentence.add_argument("--responses", required=True)
+    sentence.add_argument("--sources", required=True)
+    sentence.add_argument("--tokenizer", required=True)
+    sentence.add_argument("--output", required=True)
+    sentence.add_argument("--top-fraction", type=float, default=0.20)
+
     evaluate = commands.add_parser(
         "evaluate", help="join cached labels after scores are frozen"
     )
@@ -102,6 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--attention-dir", required=True)
     evaluate.add_argument("--graph-dir")
     evaluate.add_argument("--output", required=True)
+    evaluate.add_argument("--sentence-scores")
     evaluate.add_argument(
         "--label-shift",
         type=int,
@@ -178,6 +192,21 @@ def main(argv: list[str] | None = None) -> int:
             f"scoring complete: graphs={result['graphs']} tokens={result['tokens']} "
             f"output={result['scores']}"
         )
+    elif args.command == "sentences":
+        result = write_sentence_score_file(
+            args.scores,
+            args.attention_dir,
+            args.graph_dir,
+            args.responses,
+            args.sources,
+            args.tokenizer,
+            args.output,
+            top_fraction=args.top_fraction,
+        )
+        print(
+            f"sentence scoring complete: responses={result['responses']} "
+            f"sentences={result['sentences']} output={result['scores']}"
+        )
     else:
         result = evaluate_score_file(
             args.scores,
@@ -185,6 +214,7 @@ def main(argv: list[str] | None = None) -> int:
             args.output,
             label_shift=args.label_shift,
             graph_dir=args.graph_dir,
+            sentence_score_path=args.sentence_scores,
         )
         token = result["token"]
         sample = result["sample_max"]
@@ -196,6 +226,12 @@ def main(argv: list[str] | None = None) -> int:
             f"sample-max: AUROC={sample['auroc']:.4f} "
             f"AUPRC={sample['auprc']:.4f} n={sample['sample_count']}"
         )
+        if "sentence" in result:
+            sentence = result["sentence"]
+            print(
+                f"sentence ({sentence['pooling']}): AUROC={sentence['auroc']:.4f} "
+                f"AUPRC={sentence['auprc']:.4f} n={sentence['sentence_count']}"
+            )
         for name, metrics in result["components"].items():
             print(
                 f"{name}: AUROC={metrics['auroc']:.4f} "
