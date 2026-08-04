@@ -110,11 +110,69 @@ class GroundingFlowPipelineTests(unittest.TestCase):
         ]
 
         passed = _test_pair_coverage_gate(records, scored, minimum=0.8)
-        failed = _test_pair_coverage_gate(records, scored, minimum=0.9)
+        exclusions = [
+            {
+                "response_id": record.response_id,
+                "exclusion_reason": "unswappable",
+                "null_calibration_status": "unswappable",
+                "response_tokens": 3,
+            }
+            for record in records
+            if record.pair_id == "p4"
+        ]
+        failed = _test_pair_coverage_gate(
+            records,
+            scored,
+            minimum=0.9,
+            excluded_rows=exclusions,
+            fail_on_low_coverage=False,
+        )
+        strict = _test_pair_coverage_gate(
+            records,
+            scored,
+            minimum=0.9,
+            excluded_rows=exclusions,
+            fail_on_low_coverage=True,
+        )
 
         self.assertEqual(passed["test_pair_coverage"], 0.8)
         self.assertTrue(passed["passed"])
         self.assertFalse(failed["passed"])
+        self.assertEqual(failed["action"], "evaluate_identifiable_subset")
+        self.assertFalse(failed["coverage_target_met"])
+        self.assertEqual(
+            failed["exclusion_summary"]["response_reason_counts"],
+            {"unswappable": 2},
+        )
+        self.assertEqual(strict["action"], "fail_before_label_read")
+
+        with self.assertRaisesRegex(ValueError, "whole HaluEval pairs"):
+            _test_pair_coverage_gate(
+                records,
+                [*scored, {"response_id": "p4-0"}],
+                minimum=0.9,
+            )
+        malformed_exclusions = {
+            "missing": exclusions[:-1],
+            "duplicate": [*exclusions, exclusions[0]],
+            "extra": [
+                *exclusions,
+                {
+                    **exclusions[0],
+                    "response_id": "not-in-test",
+                },
+            ],
+        }
+        for case, rows in malformed_exclusions.items():
+            with self.subTest(case=case), self.assertRaisesRegex(
+                ValueError, "exactly identify"
+            ):
+                _test_pair_coverage_gate(
+                    records,
+                    scored,
+                    minimum=0.9,
+                    excluded_rows=rows,
+                )
 
     def test_trajectory_cache_is_weights_only_safe_and_checks_source_identity(self):
         record = TrajectoryRecord(

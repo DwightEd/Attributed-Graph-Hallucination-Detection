@@ -17,6 +17,7 @@ DEVICE="${DEVICE:-cuda:0}"
 LIMIT_PAIRS="${LIMIT_PAIRS:-none}"
 EXPECTED_CANDIDATES="${EXPECTED_CANDIDATES:-2000}"
 MIN_TEST_PAIR_COVERAGE="${MIN_TEST_PAIR_COVERAGE:-0.90}"
+FAIL_ON_LOW_COVERAGE="${FAIL_ON_LOW_COVERAGE:-0}"
 VALIDATION_FRACTION="${VALIDATION_FRACTION:-0.10}"
 TEST_FRACTION="${TEST_FRACTION:-0.20}"
 SPLIT_SEED="${SPLIT_SEED:-42}"
@@ -45,7 +46,7 @@ BOOTSTRAP_SAMPLES="${BOOTSTRAP_SAMPLES:-1000}"
 RESUME="${RESUME:-1}"
 SKIP_EVALUATION="${SKIP_EVALUATION:-0}"
 
-for setting in GROUP_BY_PROMPT REQUIRE_COMPLETE_CACHE RESUME SKIP_EVALUATION; do
+for setting in GROUP_BY_PROMPT REQUIRE_COMPLETE_CACHE FAIL_ON_LOW_COVERAGE RESUME SKIP_EVALUATION; do
   value="${!setting}"
   case "${value}" in
     0|1) ;;
@@ -94,7 +95,7 @@ echo "Grounding-flow attention-only experiment"
 echo "source_run=${SOURCE_RUN}"
 echo "extraction=${EXTRACTION_DIR}"
 echo "output=${OUTPUT_DIR}"
-echo "limit_pairs=${LIMIT_PAIRS} expected_candidates=${EXPECTED_CANDIDATES} require_complete_cache=${REQUIRE_COMPLETE_CACHE} min_test_pair_coverage=${MIN_TEST_PAIR_COVERAGE}"
+echo "limit_pairs=${LIMIT_PAIRS} expected_candidates=${EXPECTED_CANDIDATES} require_complete_cache=${REQUIRE_COMPLETE_CACHE} min_test_pair_coverage=${MIN_TEST_PAIR_COVERAGE} fail_on_low_coverage=${FAIL_ON_LOW_COVERAGE}"
 echo "gpu=${GPU_ID} device=${DEVICE} seed=${SEED}"
 echo "null_samples=${NULL_SAMPLES} swaps_per_edge=${NULL_SWAPS_PER_EDGE} lag_boundaries=${LAG_BOUNDARIES}"
 echo "pca_components=${PCA_COMPONENTS} hmm_iterations=${HMM_ITERATIONS}"
@@ -144,6 +145,9 @@ if [[ "${REQUIRE_COMPLETE_CACHE}" == "1" ]]; then
   arguments+=(--require-complete-cache)
 else
   arguments+=(--allow-partial-cache)
+fi
+if [[ "${FAIL_ON_LOW_COVERAGE}" == "1" ]]; then
+  arguments+=(--fail-on-low-coverage)
 fi
 if [[ "${RESUME}" == "0" ]]; then
   arguments+=(--no-resume)

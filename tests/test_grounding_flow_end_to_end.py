@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 
@@ -29,9 +30,20 @@ def _rows(detached: bool) -> list[list[tuple[int, float]]]:
     ]
 
 
-def _legacy(response_id: str, pair_id: str, *, detached: bool) -> tuple[dict, dict]:
+def _legacy(
+    response_id: str,
+    pair_id: str,
+    *,
+    detached: bool,
+    unswappable: bool = False,
+) -> tuple[dict, dict]:
     layers, heads, tokens = 2, 1, len(SEGMENTS)
-    layer_rows = [_rows(detached), _rows(detached)]
+    rows = (
+        [[(0, 0.20), (1, 0.20)] for _ in range(tokens - 4)]
+        if unswappable
+        else _rows(detached)
+    )
+    layer_rows = [rows, rows]
     pairs = sorted(
         {
             (source, query)
@@ -77,60 +89,73 @@ def _legacy(response_id: str, pair_id: str, *, detached: bool) -> tuple[dict, di
     return legacy, trace
 
 
+def _write_fixture(
+    root: Path,
+    *,
+    pair_count: int,
+    unswappable_responses: frozenset[str] = frozenset(),
+) -> tuple[Path, Path, Path]:
+    extraction = root / "extraction"
+    (extraction / "graphs").mkdir(parents=True)
+    (extraction / "traces").mkdir()
+    names: list[str] = []
+    response_ids: list[str] = []
+    examples: list[dict[str, object]] = []
+    labels: list[dict[str, object]] = []
+    for pair_index in range(pair_count):
+        pair_id = f"pair-{pair_index}"
+        for candidate_index in range(2):
+            response_id = f"candidate-{pair_index}-{candidate_index}"
+            name = response_id + ".pt"
+            legacy, trace = _legacy(
+                response_id,
+                pair_id,
+                detached=bool(candidate_index),
+                unswappable=response_id in unswappable_responses,
+            )
+            torch.save(legacy, extraction / "graphs" / name)
+            torch.save(trace, extraction / "traces" / name)
+            names.append(name)
+            response_ids.append(response_id)
+            examples.append(
+                {
+                    "example_id": response_id,
+                    "pair_id": pair_id,
+                    "passage": f"evidence {pair_index}",
+                    "question": f"question {pair_index}",
+                    "answer": f"candidate {candidate_index}",
+                }
+            )
+            labels.append({"example_id": response_id, "label": candidate_index})
+    (extraction / "extraction_manifest.json").write_text(
+        json.dumps(
+            {
+                "state": "complete",
+                "graph_files": names,
+                "example_ids": response_ids,
+            }
+        ),
+        encoding="utf-8",
+    )
+    examples_path = root / "examples.jsonl"
+    labels_path = root / "labels.jsonl"
+    examples_path.write_text(
+        "\n".join(json.dumps(row) for row in examples) + "\n",
+        encoding="utf-8",
+    )
+    labels_path.write_text(
+        "\n".join(json.dumps(row) for row in labels) + "\n",
+        encoding="utf-8",
+    )
+    return extraction, examples_path, labels_path
+
+
 class GroundingFlowEndToEndTests(unittest.TestCase):
     def test_cpu_run_trains_freezes_scores_then_evaluates(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            extraction = root / "extraction"
-            (extraction / "graphs").mkdir(parents=True)
-            (extraction / "traces").mkdir()
-            names: list[str] = []
-            response_ids: list[str] = []
-            examples: list[dict[str, object]] = []
-            labels: list[dict[str, object]] = []
-            for pair_index in range(6):
-                pair_id = f"pair-{pair_index}"
-                for candidate_index in range(2):
-                    response_id = f"candidate-{pair_index}-{candidate_index}"
-                    name = response_id + ".pt"
-                    legacy, trace = _legacy(
-                        response_id, pair_id, detached=bool(candidate_index)
-                    )
-                    torch.save(legacy, extraction / "graphs" / name)
-                    torch.save(trace, extraction / "traces" / name)
-                    names.append(name)
-                    response_ids.append(response_id)
-                    examples.append(
-                        {
-                            "example_id": response_id,
-                            "pair_id": pair_id,
-                            "passage": f"evidence {pair_index}",
-                            "question": f"question {pair_index}",
-                            "answer": f"candidate {candidate_index}",
-                        }
-                    )
-                    labels.append(
-                        {"example_id": response_id, "label": candidate_index}
-                    )
-            (extraction / "extraction_manifest.json").write_text(
-                json.dumps(
-                    {
-                        "state": "complete",
-                        "graph_files": names,
-                        "example_ids": response_ids,
-                    }
-                ),
-                encoding="utf-8",
-            )
-            examples_path = root / "examples.jsonl"
-            labels_path = root / "labels.jsonl"
-            examples_path.write_text(
-                "\n".join(json.dumps(row) for row in examples) + "\n",
-                encoding="utf-8",
-            )
-            labels_path.write_text(
-                "\n".join(json.dumps(row) for row in labels) + "\n",
-                encoding="utf-8",
+            extraction, examples_path, labels_path = _write_fixture(
+                root, pair_count=6
             )
             output = root / "output"
 
@@ -164,6 +189,97 @@ class GroundingFlowEndToEndTests(unittest.TestCase):
             self.assertTrue(result["identifiable_coverage_gate"]["passed"])
             frozen = json.loads((output / "score_freeze.json").read_text())
             self.assertEqual(frozen["state"], "scores_frozen_before_label_read")
+
+    def test_low_coverage_is_scoped_and_strict_mode_stops_before_labels(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            extraction, examples_path, labels_path = _write_fixture(
+                root,
+                pair_count=10,
+                # With split_seed=17 and pair splitting, pair-1 and pair-4 are
+                # test pairs.  Making one candidate in pair-4 unswappable
+                # yields one scored pair out of two without affecting fit.
+                unswappable_responses=frozenset({"candidate-4-0"}),
+            )
+
+            common = {
+                "extraction_dir": extraction,
+                "examples_path": examples_path,
+                "evaluation_labels_path": labels_path,
+                "device": "cpu",
+                "validation_fraction": 0.2,
+                "test_fraction": 0.2,
+                "split_seed": 17,
+                "group_by_prompt": False,
+                "num_nulls": 4,
+                "pca_components": 3,
+                "pca_fit_tokens": 100,
+                "hmm_iterations": 5,
+                "bootstrap_samples": 5,
+                "seed": 17,
+            }
+            report_output = root / "report-low-coverage"
+
+            from grounding_flow import evaluation as flow_evaluation
+
+            original_loader = flow_evaluation.load_halueval_response_labels
+
+            def guarded_loader(path):
+                self.assertTrue((report_output / "score_freeze.json").is_file())
+                return original_loader(path)
+
+            with mock.patch(
+                "grounding_flow.evaluation.load_halueval_response_labels",
+                side_effect=guarded_loader,
+            ) as label_loader:
+                result = run_grounding_flow(
+                    GroundingFlowRunConfig(
+                        output_dir=report_output,
+                        **common,
+                    )
+                )
+
+            self.assertEqual(label_loader.call_count, 1)
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(
+                result["experiment_scope"], "low_identifiability_subset_pilot"
+            )
+            self.assertEqual(result["identifiable_coverage_gate"]["test_pair_coverage"], 0.5)
+            self.assertEqual(
+                result["identifiable_coverage_gate"]["action"],
+                "evaluate_identifiable_subset",
+            )
+            self.assertFalse(
+                result["identifiable_coverage_gate"]["coverage_target_met"]
+            )
+            self.assertTrue((report_output / "evaluation.json").is_file())
+            test_predictions = [
+                json.loads(line)
+                for line in (report_output / "test.response_predictions.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(test_predictions), 2)
+            self.assertEqual(
+                {row["pair_id"] for row in test_predictions}, {"pair-1"}
+            )
+
+            strict_output = root / "strict-low-coverage"
+            with mock.patch(
+                "grounding_flow.evaluation.load_halueval_response_labels"
+            ) as strict_label_loader:
+                with self.assertRaisesRegex(RuntimeError, "coverage"):
+                    run_grounding_flow(
+                        GroundingFlowRunConfig(
+                            output_dir=strict_output,
+                            fail_on_low_coverage=True,
+                            **common,
+                        )
+                    )
+            strict_label_loader.assert_not_called()
+            self.assertFalse((strict_output / "score_freeze.json").exists())
+            self.assertFalse((strict_output / "evaluation.json").exists())
 
 
 if __name__ == "__main__":

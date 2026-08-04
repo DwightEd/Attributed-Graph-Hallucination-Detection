@@ -86,6 +86,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--min-test-pair-coverage", type=_coverage_fraction, default=0.90
     )
+    run.add_argument(
+        "--fail-on-low-coverage",
+        action="store_true",
+        help="stop before labels instead of reporting a scoped identifiable-subset pilot",
+    )
     group = run.add_mutually_exclusive_group()
     group.add_argument(
         "--group-by-prompt", dest="group_by_prompt", action="store_true"
@@ -144,6 +149,7 @@ def config_from_args(args: argparse.Namespace) -> GroundingFlowRunConfig:
         limit_pairs=args.limit_pairs,
         expected_candidates=args.expected_candidates,
         min_test_pair_coverage=args.min_test_pair_coverage,
+        fail_on_low_coverage=args.fail_on_low_coverage,
         group_by_prompt=args.group_by_prompt,
         require_complete_cache=args.require_complete_cache,
         evidence_segment_ids=tuple(args.evidence_segments),
@@ -220,6 +226,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     result = args.handler(args)
     metrics = result.get("core_metrics", {})
+    coverage = result.get("identifiable_coverage_gate", {})
+    if isinstance(coverage, dict) and not coverage.get("coverage_target_met", True):
+        print(
+            json.dumps(
+                {
+                    "event": "low_identifiability_coverage",
+                    "coverage": coverage.get("test_pair_coverage"),
+                    "minimum": coverage.get("minimum_test_pair_coverage"),
+                    "population": coverage.get("evaluation_population"),
+                    "warning": coverage.get("warning"),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
     length_auroc: object = "n/a"
     evaluation_path = result.get("evaluation")
     if evaluation_path:

@@ -29,6 +29,7 @@ class GroundingFlowCliTests(unittest.TestCase):
         self.assertEqual(config.hmm_iterations, 50)
         self.assertEqual(config.expected_candidates, 2000)
         self.assertEqual(config.min_test_pair_coverage, 0.9)
+        self.assertFalse(config.fail_on_low_coverage)
         self.assertTrue(config.require_complete_cache)
         self.assertTrue(config.group_by_prompt)
         self.assertTrue(config.resume)
@@ -53,6 +54,7 @@ class GroundingFlowCliTests(unittest.TestCase):
                 "none",
                 "--no-resume",
                 "--no-group-by-prompt",
+                "--fail-on-low-coverage",
             ]
         )
         config = config_from_args(args)
@@ -65,6 +67,7 @@ class GroundingFlowCliTests(unittest.TestCase):
         self.assertFalse(config.require_complete_cache)
         self.assertFalse(config.resume)
         self.assertFalse(config.group_by_prompt)
+        self.assertTrue(config.fail_on_low_coverage)
 
 
 if __name__ == "__main__":

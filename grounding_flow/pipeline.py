@@ -49,6 +49,7 @@ class GroundingFlowRunConfig:
     limit_pairs: int | None = None
     expected_candidates: int | None = None
     min_test_pair_coverage: float = 0.90
+    fail_on_low_coverage: bool = False
     group_by_prompt: bool = True
     require_complete_cache: bool = True
     evidence_segment_ids: tuple[int, ...] = (1,)
@@ -220,6 +221,10 @@ def _protocol_payload(
             "min_test_pair_coverage": config.min_test_pair_coverage,
             "bootstrap_samples": config.bootstrap_samples,
             "skip_evaluation": config.skip_evaluation,
+            # fail_on_low_coverage is deliberately a resumable reporting
+            # control: it never changes trajectories, frozen scores, or
+            # metric definitions, only whether a failed target stops before
+            # the already-isolated evaluation boundary.
         },
     }
 
@@ -377,6 +382,8 @@ def _test_pair_coverage_gate(
     scored_rows: Sequence[Mapping[str, object]],
     *,
     minimum: float,
+    excluded_rows: Sequence[Mapping[str, object]] | None = None,
+    fail_on_low_coverage: bool = False,
 ) -> dict[str, object]:
     pair_members: dict[str, set[str]] = {}
     for record in test_records:
@@ -396,6 +403,43 @@ def _test_pair_coverage_gate(
         raise ValueError("test scoring must retain or exclude whole HaluEval pairs")
     scored_pairs = sum(members.issubset(scored_ids) for members in pair_members.values())
     coverage = float(scored_pairs / len(pair_members))
+    passed = coverage >= minimum
+    excluded = tuple(excluded_rows or ())
+    reason_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
+    response_lengths: list[float] = []
+    if excluded_rows is not None:
+        excluded_ids = [str(row.get("response_id", "")) for row in excluded]
+        if (
+            any(not response_id for response_id in excluded_ids)
+            or len(set(excluded_ids)) != len(excluded_ids)
+            or set(excluded_ids) != all_ids - scored_ids
+        ):
+            raise ValueError(
+                "test coverage exclusions must exactly identify every unscored response"
+            )
+    for row in excluded:
+        reason = str(row.get("exclusion_reason", "unknown"))
+        status = str(row.get("null_calibration_status", "unknown"))
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if "response_tokens" in row:
+            response_lengths.append(float(row["response_tokens"]))
+    length_summary: dict[str, object] = {"count": len(response_lengths)}
+    if response_lengths:
+        values = np.asarray(response_lengths, dtype=np.float64)
+        if not np.isfinite(values).all() or bool((values < 0).any()):
+            raise ValueError(
+                "coverage exclusion response lengths must be finite and non-negative"
+            )
+        length_summary.update(
+            {
+                "minimum": float(values.min()),
+                "median": float(np.median(values)),
+                "mean": float(values.mean()),
+                "maximum": float(values.max()),
+            }
+        )
     return {
         "schema": "grounding-flow-identifiable-coverage-v1",
         "total_test_pairs": len(pair_members),
@@ -403,7 +447,32 @@ def _test_pair_coverage_gate(
         "excluded_test_pairs": len(pair_members) - scored_pairs,
         "test_pair_coverage": coverage,
         "minimum_test_pair_coverage": float(minimum),
-        "passed": coverage >= minimum,
+        "passed": passed,
+        "coverage_target_met": passed,
+        "evaluation_population": "null_identifiable_complete_test_pairs",
+        "action": (
+            "evaluate_configured_coverage"
+            if passed
+            else (
+                "fail_before_label_read"
+                if fail_on_low_coverage
+                else "evaluate_identifiable_subset"
+            )
+        ),
+        "eligible_for_configured_coverage_claim": passed,
+        "exclusion_summary": {
+            "response_reason_counts": reason_counts,
+            "response_calibration_status_counts": status_counts,
+            "response_tokens": length_summary,
+        },
+        "warning": (
+            None
+            if passed
+            else (
+                "conditional-null metrics cover only the identifiable complete-pair "
+                "subset and are not eligible for the configured coverage claim"
+            )
+        ),
     }
 
 
@@ -512,9 +581,11 @@ def run_grounding_flow(
         partitions["test"],
         response_predictions["test"],
         minimum=config.min_test_pair_coverage,
+        excluded_rows=calibration_exclusions["test"],
+        fail_on_low_coverage=config.fail_on_low_coverage,
     )
     atomic_json(output / "identifiable_coverage_gate.json", coverage_gate)
-    if not bool(coverage_gate["passed"]):
+    if coverage_gate["action"] == "fail_before_label_read":
         _write_run_state(
             state_path, protocol_id=protocol_id, stage="coverage_gate_failed"
         )
@@ -578,6 +649,7 @@ def run_grounding_flow(
                 "raw_unknown_mass": "mean_unknown",
             },
         )
+        evaluation["coverage_context"] = coverage_gate
         evaluation_path = output / "evaluation.json"
         atomic_json(evaluation_path, evaluation)
         wall_time_seconds["evaluation"] = time.perf_counter() - stage_started
@@ -585,10 +657,16 @@ def run_grounding_flow(
 
     primary = {} if evaluation is None else dict(evaluation["primary"])
     wall_time_seconds["total"] = time.perf_counter() - run_started
+    low_coverage = not bool(coverage_gate["coverage_target_met"])
     result: dict[str, object] = {
         "schema": METHOD_SCHEMA,
         "status": "complete",
-        "experiment_scope": preparation_metadata["scope"],
+        "experiment_scope": (
+            "low_identifiability_subset_pilot"
+            if low_coverage
+            else preparation_metadata["scope"]
+        ),
+        "input_scope": preparation_metadata["scope"],
         "labels_read_during": "never" if config.skip_evaluation else "evaluation_only",
         "method": {
             "graph_use": "layer-head evidence-provenance transport",
@@ -622,6 +700,8 @@ def run_grounding_flow(
             for key in ("auroc", "average_precision", "paired_accuracy", "positive_fraction")
             if key in primary
         },
+        "core_metrics_population": coverage_gate["evaluation_population"],
+        "warnings": ([coverage_gate["warning"]] if low_coverage else []),
         "wall_time_seconds": wall_time_seconds,
         "identifiable_coverage_gate": coverage_gate,
         "training": {

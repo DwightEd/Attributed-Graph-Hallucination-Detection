@@ -105,8 +105,11 @@ EXPECTED_CANDIDATES=none REQUIRE_COMPLETE_CACHE=0 LIMIT_PAIRS=50 \
   bash ./grounding_flow/run_halueval.sh
 ```
 
-`MIN_TEST_PAIR_COVERAGE` 默认是 `0.90`；只有明确的诊断性 pilot 才建议降低它。正式结果
-不能通过降低覆盖率门槛来隐藏大量 `unswappable` 回答。
+`MIN_TEST_PAIR_COVERAGE` 默认仍是 `0.90`，程序不会为跑完实验而自动降低它。若实际覆盖率
+未达标，默认会冻结分数并继续输出仅限于 `null-identifiable complete-pair subset` 的诊断结果；
+此时 `coverage_target_met=false`，`experiment_scope=low_identifiability_subset_pilot`，不能当作
+满足 90% 覆盖率的正式总体结果。若希望未达标时仍在读取标签前严格停止，设置
+`FAIL_ON_LOW_COVERAGE=1`。
 
 先做小规模完整链路测试：
 
