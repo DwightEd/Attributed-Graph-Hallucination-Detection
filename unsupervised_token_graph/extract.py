@@ -452,6 +452,7 @@ def _build_graph_and_feature_record(
     tau: float,
     include_prefix_edges: bool,
     include_hidden_nodes: bool,
+    include_logit_node_features: bool,
 ) -> tuple[dict[str, object], dict[str, object]]:
     """Share the expensive all-layer max and release summary temporaries first."""
 
@@ -478,6 +479,7 @@ def _build_graph_and_feature_record(
             edge_presence=edge_presence,
             tau=tau,
             include_prefix_edges=include_prefix_edges,
+            include_logit_node_features=include_logit_node_features,
         )
     return graph, feature_record
 
@@ -500,6 +502,7 @@ def _fingerprint(
     include_prefix_edges: bool,
     include_hidden_nodes: bool,
     *,
+    include_logit_node_features: bool = True,
     max_tokens: int | None = None,
     model_signature: str | None = None,
     extraction_dtype: str = "unknown",
@@ -509,7 +512,7 @@ def _fingerprint(
 ) -> str:
     payload = json.dumps(
         {
-            "schema": "token_trace_graph_v4",
+            "schema": "token_trace_graph_v5",
             "text": example.text,
             "model_id": model_id,
             "model_signature": model_signature or model_id,
@@ -517,6 +520,7 @@ def _fingerprint(
             "tau": tau,
             "include_prefix_edges": include_prefix_edges,
             "include_hidden_nodes": include_hidden_nodes,
+            "include_logit_node_features": include_logit_node_features,
             "max_tokens": max_tokens,
             "extraction_dtype": extraction_dtype,
             "postprocess_device": postprocess_device,
@@ -600,6 +604,7 @@ def extract_prepared_dataset(
     tau: float,
     include_prefix_edges: bool,
     include_hidden_nodes: bool,
+    include_logit_node_features: bool = True,
     overwrite: bool = False,
     model_signature: str | None = None,
     max_attention_bytes: int | None = None,
@@ -631,6 +636,7 @@ def extract_prepared_dataset(
             tau,
             include_prefix_edges,
             include_hidden_nodes,
+            include_logit_node_features=include_logit_node_features,
             max_tokens=max_tokens,
             model_signature=model_signature,
             extraction_dtype=extraction_dtype,
@@ -712,6 +718,7 @@ def extract_prepared_dataset(
                     tau=tau,
                     include_prefix_edges=include_prefix_edges,
                     include_hidden_nodes=include_hidden_nodes,
+                    include_logit_node_features=include_logit_node_features,
                 )
             except torch.OutOfMemoryError:
                 attention_device = torch.as_tensor(trace["attention"]).device
@@ -728,6 +735,7 @@ def extract_prepared_dataset(
                     tau=tau,
                     include_prefix_edges=include_prefix_edges,
                     include_hidden_nodes=include_hidden_nodes,
+                    include_logit_node_features=include_logit_node_features,
                 )
             trace["feature_record"] = feature_record
             if model_device.type == "cuda":
@@ -801,6 +809,7 @@ def extract_prepared_dataset(
         "tau": tau,
         "include_prefix_edges": include_prefix_edges,
         "include_hidden_nodes": include_hidden_nodes,
+        "include_logit_node_features": include_logit_node_features,
         "max_attention_bytes": max_attention_bytes,
         "extraction_dtype": extraction_dtype,
         "postprocess_device_policy": postprocess_device,
@@ -808,7 +817,7 @@ def extract_prepared_dataset(
         "postprocess_fallback_counts": postprocess_fallback_counts,
         "retain_dense_attention": retain_dense_attention,
         "trace_storage_dtype": "float16",
-        "postprocessing_schema": "token_trace_graph_v4",
+        "postprocessing_schema": "token_trace_graph_v5",
         "feature_reduction_dtype": "float32",
         "extracted_examples": extracted_examples,
         "reused_examples": reused_examples,
@@ -845,6 +854,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tau", type=float, default=0.05)
     parser.add_argument("--drop-prefix-edges", action="store_true")
     parser.add_argument("--include-hidden-nodes", action="store_true")
+    parser.add_argument(
+        "--exclude-logit-node-features",
+        action="store_true",
+        help=(
+            "Exclude teacher-forced token log-probability, entropy, and their "
+            "validity bits from Graph-MAE node features"
+        ),
+    )
     parser.add_argument("--limit", type=int)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--device", default="cuda:0")
@@ -902,6 +919,7 @@ def main(argv: list[str] | None = None) -> int:
         tau=args.tau,
         include_prefix_edges=not args.drop_prefix_edges,
         include_hidden_nodes=args.include_hidden_nodes,
+        include_logit_node_features=not args.exclude_logit_node_features,
         overwrite=args.overwrite,
         model_signature=source_signature,
         max_attention_bytes=int(args.max_attention_gib * 1024**3),

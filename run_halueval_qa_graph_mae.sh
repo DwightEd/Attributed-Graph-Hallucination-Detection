@@ -17,8 +17,17 @@ GPU_ID="${GPU_ID:-0}"
 MAX_TOKENS="${MAX_TOKENS:-1024}"
 MAX_ATTENTION_GIB="${MAX_ATTENTION_GIB:-12}"
 CPU_THREADS="${CPU_THREADS:-4}"
+INCLUDE_LOGIT_NODE_FEATURES="${INCLUDE_LOGIT_NODE_FEATURES:-0}"
 
-RUN_DIR="${RUN_DIR:-${DATA_ROOT}/feature_extraction/halueval_qa_graph_mae_${PILOT_LIMIT}_$(date -u +%Y%m%dT%H%M%SZ)}"
+case "${INCLUDE_LOGIT_NODE_FEATURES}" in
+  0) NODE_FEATURE_TAG="no_logits" ;;
+  1) NODE_FEATURE_TAG="with_logits" ;;
+  *)
+    echo "INCLUDE_LOGIT_NODE_FEATURES must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+RUN_DIR="${RUN_DIR:-${DATA_ROOT}/feature_extraction/halueval_qa_graph_mae_${NODE_FEATURE_TAG}_${PILOT_LIMIT}_$(date -u +%Y%m%dT%H%M%SZ)}"
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "Python executable does not exist: ${PYTHON_BIN}" >&2
@@ -44,6 +53,7 @@ echo "HaluEval graph-MAE experiment"
 echo "candidates=${PILOT_LIMIT}"
 echo "expected_pairs=$((PILOT_LIMIT / 2))"
 echo "expected_test_pairs=$((PILOT_LIMIT / 10))"
+echo "include_logit_node_features=${INCLUDE_LOGIT_NODE_FEATURES}"
 echo "run_dir=${RUN_DIR}"
 
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -66,6 +76,7 @@ env \
   DTYPE=float16 \
   POSTPROCESS_DEVICE=auto \
   RETAIN_DENSE_ATTENTION=0 \
+  INCLUDE_LOGIT_NODE_FEATURES="${INCLUDE_LOGIT_NODE_FEATURES}" \
   CPU_THREADS="${CPU_THREADS}" \
   RUN_TRAINING=1 \
   bash "${SCRIPT_DIR}/run_unsupervised_token_graph_pilot.sh"

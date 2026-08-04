@@ -16,6 +16,7 @@ DEVICE="${DEVICE:-cuda:0}"
 DTYPE="${DTYPE:-float16}"
 POSTPROCESS_DEVICE="${POSTPROCESS_DEVICE:-auto}"
 RETAIN_DENSE_ATTENTION="${RETAIN_DENSE_ATTENTION:-0}"
+INCLUDE_LOGIT_NODE_FEATURES="${INCLUDE_LOGIT_NODE_FEATURES:-1}"
 CPU_THREADS="${CPU_THREADS:-4}"
 
 PREPARED_DIR="${RUN_DIR}/prepared"
@@ -39,6 +40,13 @@ case "${RETAIN_DENSE_ATTENTION}" in
     exit 2
     ;;
 esac
+case "${INCLUDE_LOGIT_NODE_FEATURES}" in
+  0|1) ;;
+  *)
+    echo "INCLUDE_LOGIT_NODE_FEATURES must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
 if [[ ! "${CPU_THREADS}" =~ ^[1-9][0-9]*$ ]]; then
   echo "CPU_THREADS must be a positive integer" >&2
   exit 2
@@ -54,6 +62,11 @@ export TOKENIZERS_PARALLELISM=false
 EXTRACTION_STORAGE_ARGS=()
 if [[ "${RETAIN_DENSE_ATTENTION}" == "0" ]]; then
   EXTRACTION_STORAGE_ARGS+=(--discard-dense-attention)
+fi
+
+GRAPH_NODE_FEATURE_ARGS=()
+if [[ "${INCLUDE_LOGIT_NODE_FEATURES}" == "0" ]]; then
+  GRAPH_NODE_FEATURE_ARGS+=(--exclude-logit-node-features)
 fi
 
 if [[ "${DATASET}" == "halueval_qa" ]]; then
@@ -92,6 +105,7 @@ fi
   --device "${DEVICE}" \
   --dtype "${DTYPE}" \
   --postprocess-device "${POSTPROCESS_DEVICE}" \
+  "${GRAPH_NODE_FEATURE_ARGS[@]}" \
   "${EXTRACTION_STORAGE_ARGS[@]}"
 
 "${PYTHON_BIN}" -m unsupervised_token_graph.audit \

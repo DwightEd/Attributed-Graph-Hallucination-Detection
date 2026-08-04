@@ -11,6 +11,7 @@ from unsupervised_token_graph.extract import (
     _estimate_attention_storage_bytes,
     _fingerprint,
     _resolve_postprocess_device,
+    build_parser,
     compute_teacher_forced_statistics,
     extract_example_trace,
     extract_prepared_dataset,
@@ -60,6 +61,21 @@ class _FakeModel(torch.nn.Module):
 
 
 class SingleTokenizationTests(unittest.TestCase):
+    def test_extraction_cli_can_exclude_logit_node_features(self):
+        args = build_parser().parse_args(
+            [
+                "--examples",
+                "examples.jsonl",
+                "--model",
+                "model-a",
+                "--output-dir",
+                "output",
+                "--exclude-logit-node-features",
+            ]
+        )
+
+        self.assertTrue(args.exclude_logit_node_features)
+
     def test_final_composed_text_is_tokenized_once_and_segments_are_aligned(self):
         example = compose_example(
             "Passage evidence.",
@@ -155,6 +171,30 @@ class SingleTokenizationTests(unittest.TestCase):
             max_tokens=256,
         )
         self.assertNotEqual(lower_limit, higher_limit)
+
+    def test_cache_fingerprint_changes_when_logit_node_policy_changes(self):
+        example = compose_example("P", "Q", "A", example_id="sample")
+
+        with_logits = _fingerprint(
+            example,
+            "model-a",
+            (1,),
+            0.05,
+            True,
+            False,
+            include_logit_node_features=True,
+        )
+        without_logits = _fingerprint(
+            example,
+            "model-a",
+            (1,),
+            0.05,
+            True,
+            False,
+            include_logit_node_features=False,
+        )
+
+        self.assertNotEqual(with_logits, without_logits)
 
     def test_cache_fingerprint_changes_when_extraction_dtype_changes(self):
         example = compose_example("P", "Q", "A", example_id="sample")
@@ -364,6 +404,90 @@ class TraceSummaryTests(unittest.TestCase):
 
 
 class ExtractionCacheIntegrityTests(unittest.TestCase):
+    def test_extraction_excludes_logit_views_and_records_policy(self):
+        example = compose_example("P", "Q", "A", example_id="sample")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "extraction"
+            manifest = extract_prepared_dataset(
+                _FakeModel(),
+                _FakeTokenizer(example),
+                [example],
+                output_dir=output,
+                model_id="fake-model",
+                selected_hidden_layers=(1,),
+                max_tokens=8,
+                tau=0.05,
+                include_prefix_edges=True,
+                include_hidden_nodes=False,
+                include_logit_node_features=False,
+            )
+            graph = torch.load(
+                next((output / "graphs").glob("*.pt")),
+                map_location="cpu",
+                weights_only=True,
+            )
+
+        self.assertFalse(manifest["include_logit_node_features"])
+        self.assertEqual(
+            list(graph["x_view_slices"]),
+            ["attention_diagonal", "segment_one_hot", "position"],
+        )
+        self.assertFalse(graph["graph_config"]["include_logit_node_features"])
+
+    def test_changed_logit_node_policy_rejects_existing_cache_end_to_end(self):
+        example = compose_example("P", "Q", "A", example_id="sample")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "extraction"
+            options = {
+                "output_dir": output,
+                "model_id": "fake-model",
+                "selected_hidden_layers": (1,),
+                "max_tokens": 8,
+                "tau": 0.05,
+                "include_prefix_edges": True,
+                "include_hidden_nodes": False,
+            }
+            extract_prepared_dataset(
+                _FakeModel(),
+                _FakeTokenizer(example),
+                [example],
+                include_logit_node_features=True,
+                **options,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "Stale extraction cache"):
+                extract_prepared_dataset(
+                    _FakeModel(),
+                    _FakeTokenizer(example),
+                    [example],
+                    include_logit_node_features=False,
+                    **options,
+                )
+
+    def test_no_logit_extraction_can_resume_its_own_cache(self):
+        example = compose_example("P", "Q", "A", example_id="sample")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "extraction"
+            options = {
+                "output_dir": output,
+                "model_id": "fake-model",
+                "selected_hidden_layers": (1,),
+                "max_tokens": 8,
+                "tau": 0.05,
+                "include_prefix_edges": True,
+                "include_hidden_nodes": False,
+                "include_logit_node_features": False,
+            }
+            extract_prepared_dataset(
+                _FakeModel(), _FakeTokenizer(example), [example], **options
+            )
+            resumed = extract_prepared_dataset(
+                _FakeModel(), _FakeTokenizer(example), [example], **options
+            )
+
+        self.assertEqual(resumed["extracted_examples"], 0)
+        self.assertEqual(resumed["reused_examples"], 1)
+
     def test_first_pass_and_resumed_pass_write_identical_scalar_features(self):
         example = compose_example("P", "Q", "A", example_id="sample")
         with tempfile.TemporaryDirectory() as temporary_directory:

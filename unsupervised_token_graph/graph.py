@@ -22,6 +22,7 @@ def build_token_graph(
     edge_presence=None,
     tau: float = 0.05,
     include_prefix_edges: bool = True,
+    include_logit_node_features: bool = True,
 ) -> dict[str, object]:
     """Build a token-node graph using causal attention-threshold edges.
 
@@ -67,7 +68,7 @@ def build_token_graph(
         if hidden.shape[0] != token_count:
             raise ValueError("hidden_states must align with input_ids")
         node_views["hidden"] = hidden
-    if token_log_probs is not None:
+    if include_logit_node_features and token_log_probs is not None:
         log_probs = _tensor_on(
             token_log_probs, device=device, dtype=torch.float32
         ).reshape(token_count, 1)
@@ -80,7 +81,7 @@ def build_token_graph(
             else torch.isfinite(log_probs).float()
         )
         node_views["token_log_prob_valid"] = valid
-    if next_token_entropy is not None:
+    if include_logit_node_features and next_token_entropy is not None:
         entropy = _tensor_on(
             next_token_entropy, device=device, dtype=torch.float32
         ).reshape(token_count, 1)
@@ -146,5 +147,6 @@ def build_token_graph(
         "graph_config": {
             "tau": float(tau),
             "include_prefix_edges": bool(include_prefix_edges),
+            "include_logit_node_features": bool(include_logit_node_features),
         },
     }

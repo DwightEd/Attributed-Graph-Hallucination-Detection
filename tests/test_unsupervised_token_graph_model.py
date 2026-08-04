@@ -41,6 +41,55 @@ class SegmentTraceTests(unittest.TestCase):
 
 
 class TokenGraphConstructionTests(unittest.TestCase):
+    def test_logit_node_views_can_be_excluded_without_changing_attention_views(self):
+        input_ids = torch.tensor([10, 20, 30], dtype=torch.long)
+        segment_ids = torch.tensor([1, 2, 3], dtype=torch.long)
+        attention = torch.zeros((1, 2, 3, 3), dtype=torch.float32)
+        attention[0, :, 2, 0] = torch.tensor([0.20, 0.10])
+        token_log_probs = torch.tensor([float("nan"), -0.2, -0.3])
+        next_token_entropy = torch.tensor([float("nan"), 1.2, 1.3])
+        token_stat_valid = torch.tensor([False, True, True])
+
+        with_logits = build_token_graph(
+            input_ids,
+            attention,
+            segment_ids,
+            token_log_probs=token_log_probs,
+            next_token_entropy=next_token_entropy,
+            token_stat_valid=token_stat_valid,
+        )
+        without_logits = build_token_graph(
+            input_ids,
+            attention,
+            segment_ids,
+            token_log_probs=token_log_probs,
+            next_token_entropy=next_token_entropy,
+            token_stat_valid=token_stat_valid,
+            include_logit_node_features=False,
+        )
+
+        self.assertEqual(
+            list(without_logits["x_view_slices"]),
+            ["attention_diagonal", "segment_one_hot", "position"],
+        )
+        self.assertEqual(without_logits["x"].shape, (3, 7))
+        torch.testing.assert_close(
+            without_logits["x"], with_logits["x"][:, :7]
+        )
+        torch.testing.assert_close(
+            without_logits["edge_index"], with_logits["edge_index"]
+        )
+        torch.testing.assert_close(
+            without_logits["edge_attr"], with_logits["edge_attr"]
+        )
+        torch.testing.assert_close(
+            without_logits["edge_mark"], with_logits["edge_mark"]
+        )
+        self.assertTrue(with_logits["graph_config"]["include_logit_node_features"])
+        self.assertFalse(
+            without_logits["graph_config"]["include_logit_node_features"]
+        )
+
     def test_graph_keeps_causal_cross_segment_edges_and_encodes_both_segments(self):
         input_ids = torch.tensor([10, 11, 20, 21, 30, 31], dtype=torch.long)
         segment_ids = torch.tensor([1, 1, 2, 2, 3, 3], dtype=torch.long)

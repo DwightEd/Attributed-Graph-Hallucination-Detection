@@ -39,6 +39,14 @@ class FeaturePilotShellContractTests(unittest.TestCase):
             script,
         )
         self.assertIn('PILOT_LIMIT="${PILOT_LIMIT:-2000}"', script)
+        self.assertIn(
+            'INCLUDE_LOGIT_NODE_FEATURES="${INCLUDE_LOGIT_NODE_FEATURES:-0}"',
+            script,
+        )
+        self.assertIn(
+            'INCLUDE_LOGIT_NODE_FEATURES="${INCLUDE_LOGIT_NODE_FEATURES}"',
+            script,
+        )
         self.assertIn('RUN_TRAINING=1', script)
         self.assertIn('DATASET=halueval_qa', script)
         self.assertIn('run_unsupervised_token_graph_pilot.sh', script)
@@ -90,6 +98,23 @@ class FeaturePilotShellContractTests(unittest.TestCase):
         self.assertIn('POSTPROCESS_DEVICE="${POSTPROCESS_DEVICE:-auto}"', script)
         self.assertIn('RETAIN_DENSE_ATTENTION="${RETAIN_DENSE_ATTENTION:-0}"', script)
         self.assertIn('OMP_NUM_THREADS="${CPU_THREADS}"', script)
+
+    def test_dataset_pilot_excludes_logit_node_features_only_when_requested(self):
+        script = (
+            REPOSITORY_ROOT / "run_unsupervised_token_graph_pilot.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            'INCLUDE_LOGIT_NODE_FEATURES="${INCLUDE_LOGIT_NODE_FEATURES:-1}"',
+            script,
+        )
+        self.assertIn(
+            'if [[ "${INCLUDE_LOGIT_NODE_FEATURES}" == "0" ]]', script
+        )
+        self.assertIn(
+            'GRAPH_NODE_FEATURE_ARGS+=(--exclude-logit-node-features)', script
+        )
+        self.assertIn('"${GRAPH_NODE_FEATURE_ARGS[@]}"', script)
 
     def test_dataset_pilot_forwards_device_and_dtype_to_both_model_loads(self):
         script = (
