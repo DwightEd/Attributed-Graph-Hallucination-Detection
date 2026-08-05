@@ -319,6 +319,221 @@ def _load_saved_graph(path: Path) -> Mapping[str, object]:
     return loaded
 
 
+def validate_original_graph(graph: Mapping[str, object]) -> None:
+    """Validate one self-describing graph produced by this adapter."""
+
+    required = {
+        "schema",
+        "source_id",
+        "response_id",
+        "sample_id",
+        "split",
+        "response_idx",
+        "token_ids",
+        "node_role",
+        "x",
+        "edge_index",
+        "edge_attr",
+        "edge_mark",
+        "y_token",
+        "response_label",
+        "tau",
+        "attention_floor",
+        "metadata",
+    }
+    missing = sorted(required.difference(graph))
+    if missing:
+        raise ValueError(f"original graph is missing fields: {missing}")
+    if graph["schema"] != GRAPH_SCHEMA:
+        raise ValueError(f"unsupported original graph schema: {graph['schema']!r}")
+
+    token_ids = torch.as_tensor(graph["token_ids"])
+    node_role = torch.as_tensor(graph["node_role"])
+    node_attr = torch.as_tensor(graph["x"])
+    labels = torch.as_tensor(graph["y_token"]).flatten()
+    edge_index = torch.as_tensor(graph["edge_index"])
+    edge_attr = torch.as_tensor(graph["edge_attr"])
+    edge_mark = torch.as_tensor(graph["edge_mark"])
+    response_idx = int(graph["response_idx"])
+    node_count = int(token_ids.numel())
+    edge_count = int(edge_index.shape[1]) if edge_index.ndim == 2 else -1
+    channel_count = int(node_attr.shape[1]) if node_attr.ndim == 2 else -1
+
+    valid_shapes = (
+        token_ids.ndim == 1
+        and node_role.shape == (node_count,)
+        and node_attr.shape == (node_count, channel_count)
+        and labels.shape == (node_count,)
+        and edge_index.shape == (2, edge_count)
+        and edge_attr.shape == (edge_count, channel_count)
+        and edge_mark.shape == (edge_count, 2)
+        and 0 < response_idx < node_count
+    )
+    if not valid_shapes:
+        raise ValueError("original graph tensor shapes are inconsistent")
+    expected_role = (torch.arange(node_count) >= response_idx).to(node_role.dtype)
+    if not torch.equal(node_role.cpu(), expected_role):
+        raise ValueError("node_role does not match response_idx")
+    if bool((~((labels == 0) | (labels == 1))).any()) or bool(
+        labels[:response_idx].any()
+    ):
+        raise ValueError("y_token must be binary and prompt labels must be zero")
+    if int(graph["response_label"]) != int(labels[response_idx:].any().item()):
+        raise ValueError("response_label does not match y_token")
+    if not bool(torch.isfinite(node_attr).all()) or not bool(
+        torch.isfinite(edge_attr).all()
+    ):
+        raise ValueError("attention graph tensors must be finite")
+    if bool(((node_attr < 0) | (node_attr > 1)).any()) or bool(
+        ((edge_attr < 0) | (edge_attr > 1)).any()
+    ):
+        raise ValueError("attention graph tensors must lie in [0, 1]")
+
+    if edge_count:
+        source, target = edge_index
+        valid_edges = (
+            not bool((source < 0).any())
+            and not bool((target >= node_count).any())
+            and bool((source < target).all())
+            and bool((target >= response_idx).all())
+        )
+        if not valid_edges:
+            raise ValueError("edge_index violates causal RP/RR graph constraints")
+        expected_mark = torch.nn.functional.one_hot(
+            (source >= response_idx).long(), num_classes=2
+        ).to(dtype=edge_mark.dtype)
+        if not torch.equal(edge_mark.cpu(), expected_mark.cpu()):
+            raise ValueError("edge_mark does not match RP/RR source roles")
+
+    metadata = graph["metadata"]
+    if not isinstance(metadata, Mapping) or metadata.get("schema") != (
+        GRAPH_METADATA_SCHEMA
+    ):
+        raise ValueError("original graph metadata is absent or unsupported")
+    layers = int(metadata.get("num_attention_layers", 0))
+    heads = int(metadata.get("num_attention_heads", 0))
+    channels = int(metadata.get("num_attention_channels", 0))
+    if layers < 1 or heads < 1 or channels != layers * heads or channels != channel_count:
+        raise ValueError("graph layer/head metadata does not match feature channels")
+    if metadata.get("channel_order") != "layer_major_head_minor":
+        raise ValueError("unsupported attention channel order")
+
+
+def load_original_graph(path: str | Path) -> dict[str, object]:
+    """Safely load and validate one reusable ``.graph.pt`` artifact."""
+
+    graph_path = Path(path).expanduser().resolve()
+    graph = dict(_load_saved_graph(graph_path))
+    validate_original_graph(graph)
+    return graph
+
+
+def inspect_original_graph(
+    graph_or_path: Mapping[str, object] | str | Path,
+    *,
+    max_nodes: int = 5,
+    max_edges: int = 5,
+) -> dict[str, object]:
+    """Return a JSON-safe description and bounded preview of one graph."""
+
+    if max_nodes < 0 or max_edges < 0:
+        raise ValueError("max_nodes and max_edges cannot be negative")
+    graph = (
+        load_original_graph(graph_or_path)
+        if isinstance(graph_or_path, (str, Path))
+        else dict(graph_or_path)
+    )
+    validate_original_graph(graph)
+
+    token_ids = torch.as_tensor(graph["token_ids"]).cpu()
+    node_role = torch.as_tensor(graph["node_role"]).cpu()
+    node_attr = torch.as_tensor(graph["x"]).cpu()
+    labels = torch.as_tensor(graph["y_token"]).cpu()
+    edge_index = torch.as_tensor(graph["edge_index"]).cpu()
+    edge_attr = torch.as_tensor(graph["edge_attr"]).cpu()
+    edge_mark = torch.as_tensor(graph["edge_mark"]).cpu()
+    metadata = dict(graph["metadata"])
+    response_idx = int(graph["response_idx"])
+    node_count = int(token_ids.numel())
+    edge_count = int(edge_index.shape[1])
+    rp_edges = int((edge_mark[:, 0] == 1).sum().item())
+    rr_edges = int((edge_mark[:, 1] == 1).sum().item())
+
+    def tensor_description(value: torch.Tensor) -> dict[str, object]:
+        return {
+            "shape": list(value.shape),
+            "dtype": str(value.dtype).removeprefix("torch."),
+        }
+
+    node_preview = []
+    for node_index in range(min(max_nodes, node_count)):
+        node_preview.append(
+            {
+                "node_index": node_index,
+                "token_id": int(token_ids[node_index]),
+                "role": "response" if int(node_role[node_index]) else "prompt",
+                "y_token": int(labels[node_index]),
+                "x": node_attr[node_index].tolist(),
+            }
+        )
+    edge_preview = []
+    for edge_id in range(min(max_edges, edge_count)):
+        source = int(edge_index[0, edge_id])
+        target = int(edge_index[1, edge_id])
+        edge_preview.append(
+            {
+                "edge_id": edge_id,
+                "source": source,
+                "target": target,
+                "relation": "RP" if int(edge_mark[edge_id, 0]) else "RR",
+                "edge_mark": edge_mark[edge_id].tolist(),
+                "attention_by_channel": edge_attr[edge_id].tolist(),
+            }
+        )
+
+    return {
+        "schema": "original-ragtruth-graph-inspection-v1",
+        "graph_schema": str(graph["schema"]),
+        "identity": {
+            "source_id": str(graph["source_id"]),
+            "response_id": str(graph["response_id"]),
+            "sample_id": str(graph["sample_id"]),
+            "split": str(graph["split"]),
+        },
+        "dimensions": {
+            "nodes": node_count,
+            "prompt_nodes": response_idx,
+            "response_nodes": node_count - response_idx,
+            "edges": edge_count,
+            "rp_edges": rp_edges,
+            "rr_edges": rr_edges,
+            "layers": int(metadata["num_attention_layers"]),
+            "heads": int(metadata["num_attention_heads"]),
+            "channels": int(metadata["num_attention_channels"]),
+        },
+        "labels": {
+            "hallucinated_response_tokens": int(labels[response_idx:].sum().item()),
+            "response_label": int(graph["response_label"]),
+        },
+        "tensors": {
+            name: tensor_description(torch.as_tensor(graph[name]))
+            for name in (
+                "token_ids",
+                "node_role",
+                "x",
+                "edge_index",
+                "edge_attr",
+                "edge_mark",
+                "y_token",
+            )
+        },
+        "metadata": metadata,
+        "field_schema": GRAPH_FIELD_SCHEMA,
+        "node_preview": node_preview,
+        "edge_preview": edge_preview,
+    }
+
+
 def _graph_matches_source(
     graph: Mapping[str, object],
     *,

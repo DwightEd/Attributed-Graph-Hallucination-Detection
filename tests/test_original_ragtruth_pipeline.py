@@ -15,7 +15,12 @@ from pathlib import Path
 
 import torch
 
-from original.ragtruth_graph import build_original_graph, prepare_original_graphs
+from original.cli import main as original_main
+from original.ragtruth_graph import (
+    build_original_graph,
+    inspect_original_graph,
+    prepare_original_graphs,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -235,6 +240,89 @@ class OriginalRagTruthGraphTests(unittest.TestCase):
     def test_tau_below_sparse_cache_floor_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "tau.*attention.*floor|floor.*tau"):
             build_original_graph(_formal_sparse_fixture(), tau=0.005)
+
+    def test_inspect_reports_tensor_contract_labels_and_bounded_previews(self):
+        graph = build_original_graph(_formal_sparse_fixture(split="test"), tau=0.05)
+
+        report = inspect_original_graph(graph, max_nodes=2, max_edges=2)
+        round_trip = json.loads(json.dumps(report))
+
+        self.assertEqual(round_trip["schema"], "original-ragtruth-graph-inspection-v1")
+        self.assertEqual(
+            round_trip["identity"],
+            {
+                "source_id": "source-17",
+                "response_id": "response-23",
+                "sample_id": "response-23",
+                "split": "test",
+            },
+        )
+        self.assertEqual(
+            round_trip["dimensions"],
+            {
+                "nodes": 5,
+                "prompt_nodes": 2,
+                "response_nodes": 3,
+                "edges": 6,
+                "rp_edges": 4,
+                "rr_edges": 2,
+                "layers": 2,
+                "heads": 2,
+                "channels": 4,
+            },
+        )
+        self.assertEqual(round_trip["tensors"]["x"], {"shape": [5, 4], "dtype": "float32"})
+        self.assertEqual(
+            round_trip["tensors"]["edge_index"],
+            {"shape": [2, 6], "dtype": "int64"},
+        )
+        self.assertEqual(len(round_trip["node_preview"]), 2)
+        self.assertEqual(len(round_trip["edge_preview"]), 2)
+        self.assertEqual(
+            round_trip["node_preview"][0],
+            {
+                "node_index": 0,
+                "token_id": 101,
+                "role": "prompt",
+                "y_token": 0,
+                "x": graph["x"][0].tolist(),
+            },
+        )
+        self.assertEqual(round_trip["edge_preview"][0]["source"], 0)
+        self.assertEqual(round_trip["edge_preview"][0]["target"], 2)
+        self.assertEqual(round_trip["edge_preview"][0]["relation"], "RP")
+        self.assertEqual(
+            round_trip["edge_preview"][0]["attention_by_channel"],
+            graph["edge_attr"][0].tolist(),
+        )
+
+    def test_inspect_cli_prints_one_json_document(self):
+        with tempfile.TemporaryDirectory() as directory:
+            graph_path = Path(directory) / "sample.graph.pt"
+            torch.save(build_original_graph(_formal_sparse_fixture(), tau=0.05), graph_path)
+
+            import contextlib
+            import io
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                exit_code = original_main(
+                    [
+                        "inspect",
+                        "--graph",
+                        str(graph_path),
+                        "--max-nodes",
+                        "1",
+                        "--max-edges",
+                        "1",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["dimensions"]["nodes"], 5)
+        self.assertEqual(len(report["node_preview"]), 1)
+        self.assertEqual(len(report["edge_preview"]), 1)
 
     def test_prepare_persists_labeled_graph_manifest_and_reuses_valid_output(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from attention_graph.data import audit_attention_cache
 
-from .ragtruth_graph import prepare_original_graphs
+from .ragtruth_graph import inspect_original_graph, prepare_original_graphs
 from .train import run_training
 
 
@@ -91,6 +91,16 @@ def _audit(args: argparse.Namespace) -> int:
     return 0 if all(row["complete"] for row in report.values()) else 1
 
 
+def _inspect(args: argparse.Namespace) -> int:
+    report = inspect_original_graph(
+        args.graph,
+        max_nodes=args.max_nodes,
+        max_edges=args.max_edges,
+    )
+    print(json.dumps(report, indent=2, sort_keys=True), flush=True)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Reproduce the original attributed-graph RAGTruth baseline"
@@ -103,6 +113,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--splits", nargs="+", choices=("train", "test"), default=("train", "test")
     )
     audit.set_defaults(handler=_audit)
+
+    inspect = subparsers.add_parser(
+        "inspect", help="describe one saved graph, including token labels"
+    )
+    inspect.add_argument("--graph", type=Path, required=True)
+    inspect.add_argument("--max-nodes", type=int, default=5)
+    inspect.add_argument("--max-edges", type=int, default=5)
+    inspect.set_defaults(handler=_inspect)
 
     build = subparsers.add_parser("build", help="persist original-format token graphs")
     build.add_argument("--cache-root", type=Path, required=True)
