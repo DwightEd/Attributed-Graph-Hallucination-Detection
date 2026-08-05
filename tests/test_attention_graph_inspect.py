@@ -210,6 +210,51 @@ class AttentionGraphInspectTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "duplicate response_id"):
                 resolve_graph(run_dir, response_id="duplicate")
 
+    def test_inspector_prefers_artifact_index_over_minimal_labeled_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            graph_dir = run_dir / "prepared" / "graphs"
+            graph_path = graph_dir / "train" / "attention_a.graph.pt"
+            _write_graph(graph_path, _toy_graph())
+            artifact_index = graph_dir / "artifact_index.json"
+            artifact_index.write_text(
+                json.dumps(
+                    [
+                        {
+                            "response_id": "response-a",
+                            "dataset_split": "train",
+                            "graph_path": str(graph_path),
+                            "num_nodes": 5,
+                            "num_response_nodes": 2,
+                            "num_edges": 4,
+                            "num_rp_edges": 3,
+                            "num_rr_edges": 1,
+                            "num_traces": 6,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (graph_dir / "index.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "response_id": "response-a",
+                            "pair_id": "source-a",
+                            "split": "validation",
+                            "label": 1,
+                            "graph_path": str(graph_path),
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            report = inspect_run(run_dir)
+
+        self.assertEqual(report["graph_index"], str(artifact_index.resolve()))
+        self.assertEqual(report["inventory"]["split_counts"], {"train": 1})
+
     def test_resolve_graph_rejects_index_path_outside_prepared_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

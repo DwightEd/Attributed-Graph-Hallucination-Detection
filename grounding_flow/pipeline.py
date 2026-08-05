@@ -30,7 +30,6 @@ from .evaluation import (
 from .experiment import DetectorFitConfig, GroundingFlowDetector
 from .method import NullModelConfig
 
-
 METHOD_SCHEMA = "grounding-flow-conditional-null-hmm-v1"
 
 
@@ -612,6 +611,7 @@ def run_grounding_flow(
 
     evaluation_path: Path | None = None
     evaluation: dict[str, object] | None = None
+    graph_dataset_index = output / "prepared" / "graphs" / "index.json"
     if not config.skip_evaluation:
         stage_started = time.perf_counter()
         if labels_path is None:  # pragma: no cover - config validation guarantees this
@@ -648,6 +648,17 @@ def run_grounding_flow(
                 "raw_debt": "mean_debt",
                 "raw_unknown_mass": "mean_unknown",
             },
+            graph_index_rows=[
+                {
+                    "response_id": record.response_id,
+                    "pair_id": record.pair_id,
+                    "split": partition,
+                    "graph_path": str(record.graph_record.graph_path),
+                }
+                for partition in ("train", "validation", "test")
+                for record in partitions[partition]
+            ],
+            graph_index_path=graph_dataset_index,
         )
         evaluation["coverage_context"] = coverage_gate
         evaluation_path = output / "evaluation.json"
@@ -687,6 +698,9 @@ def run_grounding_flow(
         "detector": str(detector_path),
         "splits": str(output / "splits.json"),
         "score_freeze": str(output / "score_freeze.json"),
+        "graph_dataset_index": (
+            str(graph_dataset_index) if graph_dataset_index.is_file() else None
+        ),
         "response_predictions": {
             name: str(path) for name, path in response_paths.items()
         },

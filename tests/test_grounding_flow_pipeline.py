@@ -10,18 +10,18 @@ from unittest import mock
 import numpy as np
 import torch
 
-from grounding_flow.experiment import TrajectoryRecord
-from grounding_flow.pipeline import (
-    GroundingFlowRunConfig,
-    _validate_output,
-    _protocol_payload,
-    _test_pair_coverage_gate,
-    canonical_protocol_id,
-)
 from grounding_flow.evaluation import (
     add_length_residual_scores,
     evaluate_frozen_halueval_predictions,
     freeze_prediction_files,
+)
+from grounding_flow.experiment import TrajectoryRecord
+from grounding_flow.pipeline import (
+    GroundingFlowRunConfig,
+    _protocol_payload,
+    _test_pair_coverage_gate,
+    _validate_output,
+    canonical_protocol_id,
 )
 
 
@@ -258,12 +258,35 @@ class GroundingFlowPipelineTests(unittest.TestCase):
                     labels_path=labels_path,
                     pair_by_response={"negative": "pair", "positive": "pair"},
                     response_length_by_id={"negative": 2, "positive": 3},
+                    graph_index_rows=[
+                        {
+                            "response_id": "negative",
+                            "pair_id": "pair",
+                            "split": "test",
+                            "graph_path": "/graphs/negative.graph.pt",
+                        },
+                        {
+                            "response_id": "positive",
+                            "pair_id": "pair",
+                            "split": "test",
+                            "graph_path": "/graphs/positive.graph.pt",
+                        },
+                    ],
+                    graph_index_path=output / "prepared" / "graphs" / "index.json",
                     seed=7,
                     bootstrap_samples=20,
                 )
 
+            labeled_index = json.loads(
+                (output / "prepared" / "graphs" / "index.json").read_text()
+            )
+
         self.assertAlmostEqual(result["auroc"], 1.0)
         self.assertAlmostEqual(result["paired_accuracy"], 1.0)
+        self.assertEqual(
+            {row["response_id"]: row["label"] for row in labeled_index},
+            {"negative": 0, "positive": 1},
+        )
 
     def test_prediction_freeze_rejects_nested_label_fields(self):
         with tempfile.TemporaryDirectory() as temporary:

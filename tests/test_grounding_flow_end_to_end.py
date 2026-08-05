@@ -10,7 +10,6 @@ import torch
 
 from grounding_flow.pipeline import GroundingFlowRunConfig, run_grounding_flow
 
-
 SEGMENTS = torch.tensor([1, 1, 2, 2, 3, 3, 3, 3])
 
 
@@ -189,6 +188,24 @@ class GroundingFlowEndToEndTests(unittest.TestCase):
             self.assertTrue(result["identifiable_coverage_gate"]["passed"])
             frozen = json.loads((output / "score_freeze.json").read_text())
             self.assertEqual(frozen["state"], "scores_frozen_before_label_read")
+            graph_dir = output / "prepared" / "graphs"
+            self.assertTrue((graph_dir / "artifact_index.json").is_file())
+            labeled_index = json.loads((graph_dir / "index.json").read_text())
+            self.assertEqual(len(labeled_index), 12)
+            self.assertTrue(
+                all(
+                    set(row)
+                    == {"response_id", "pair_id", "split", "label", "graph_path"}
+                    for row in labeled_index
+                )
+            )
+            self.assertEqual(
+                {
+                    split: sum(row["split"] == split for row in labeled_index)
+                    for split in ("train", "validation", "test")
+                },
+                result["partition_counts"],
+            )
 
     def test_low_coverage_is_scoped_and_strict_mode_stops_before_labels(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -280,6 +297,12 @@ class GroundingFlowEndToEndTests(unittest.TestCase):
             strict_label_loader.assert_not_called()
             self.assertFalse((strict_output / "score_freeze.json").exists())
             self.assertFalse((strict_output / "evaluation.json").exists())
+            self.assertTrue(
+                (strict_output / "prepared" / "graphs" / "artifact_index.json").exists()
+            )
+            self.assertFalse(
+                (strict_output / "prepared" / "graphs" / "index.json").exists()
+            )
 
 
 if __name__ == "__main__":

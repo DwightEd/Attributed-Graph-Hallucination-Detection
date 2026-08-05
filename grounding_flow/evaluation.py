@@ -15,6 +15,7 @@ from attention_graph.halueval import (
 )
 
 from .artifacts import atomic_json, file_sha256, iter_jsonl, read_jsonl
+from .graph_index import write_labeled_graph_index
 
 
 def _forbidden_evaluation_paths(value: object, prefix: str = "") -> set[str]:
@@ -139,9 +140,15 @@ def evaluate_frozen_halueval_predictions(
     seed: int,
     bootstrap_samples: int = 1_000,
     score_fields: Mapping[str, str] | None = None,
+    graph_index_rows: Sequence[Mapping[str, object]] | None = None,
+    graph_index_path: str | Path | None = None,
 ) -> dict[str, object]:
     """Evaluate only a checksum-verified disk snapshot, never mutable scores."""
 
+    if (graph_index_rows is None) != (graph_index_path is None):
+        raise ValueError(
+            "graph_index_rows and graph_index_path must be provided together"
+        )
     output = Path(output_dir).expanduser().resolve()
     predictions_file = Path(prediction_path).expanduser().resolve()
     _verify_frozen_file(output, predictions_file)
@@ -183,14 +190,20 @@ def evaluate_frozen_halueval_predictions(
             seed=seed,
         )
     if score_fields is None:
-        return dict(reports["primary"])
-    primary_name = next(iter(fields))
-    return {
-        "schema": "grounding-flow-halueval-evaluation-v1",
-        "primary_score": primary_name,
-        "primary": reports[primary_name],
-        "variants": reports,
-    }
+        result = dict(reports["primary"])
+    else:
+        primary_name = next(iter(fields))
+        result = {
+            "schema": "grounding-flow-halueval-evaluation-v1",
+            "primary_score": primary_name,
+            "primary": reports[primary_name],
+            "variants": reports,
+        }
+    # Reuse the one evaluation-only label read. The graph artifacts remain
+    # immutable and label-free; only the separate five-field index is written.
+    if graph_index_rows is not None and graph_index_path is not None:
+        write_labeled_graph_index(graph_index_path, graph_index_rows, all_labels)
+    return result
 
 
 __all__ = [

@@ -145,6 +145,9 @@ source identity 校验后的断点复用；不同 protocol 不会混写结果。
 ```text
 OUTPUT_DIR/
 ├── prepared/                         # legacy cache 的 attention-only 正式图适配
+│   └── graphs/
+│       ├── artifact_index.json       # 内部构图审计清单（技术字段、无标签）
+│       └── index.json                # evaluation 后生成的五字段数据索引
 ├── trajectory_cache/                 # 昂贵的逐样本 null-calibrated 轨迹
 ├── splits.json                       # pair/prompt-group 无泄漏划分
 ├── detector.json                     # PCA + HMM 参数
@@ -196,6 +199,38 @@ python -m attention_graph.inspect \
   --graph /path/to/attention_x.graph.pt \
   --top-edges 20
 ```
+
+### 图、划分与标签如何对应
+
+`.graph.pt` 始终无标签。完成分数冻结和 evaluation 后，
+`prepared/graphs/index.json` 才会生成，并且每行严格只含：
+
+```json
+{
+  "response_id": "halueval-...",
+  "pair_id": "halueval-...",
+  "split": "train|validation|test",
+  "label": 0,
+  "graph_path": "/.../attention_....graph.pt"
+}
+```
+
+这里的 `split` 是真实实验划分；不要再用内部技术清单里的 `dataset_split` 判断
+validation，因为后者只表示图文件位于物理 `train/` 或 `test/` cache 目录。
+标签关联键为 `graph.response_id = splits.json.response_id =
+evaluation_labels.example_id`；`label=0` 表示 `right_answer`，`label=1` 表示
+`hallucinated_answer`。标签不会进入无监督训练或图 tensor。
+
+给已经完成的历史运行补出该索引，无需重构图或重新训练：
+
+```bash
+bash ./grounding_flow/export_graph_index.sh
+```
+
+脚本优先读取 `run.json` 记录的 evaluation-label sidecar；如果旧 sidecar 已被移动或
+清理，则从 `/share/home/tm902089733300000/a903202310/lys/data/HaluEval/qa_data.json`
+按原始确定性 ID 规则重建标签映射。旧的技术 `index.json` 会保留为
+`artifact_index.json`，图文件本身不会被修改。
 
 ## 当前数据限制
 

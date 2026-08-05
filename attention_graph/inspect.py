@@ -60,6 +60,9 @@ def _positive_int(value: str) -> int:
 def _json_index_path(run_dir: str | Path) -> tuple[Path, Path]:
     root = Path(run_dir).expanduser().resolve()
     candidates = (
+        root / "prepared" / "graphs" / "artifact_index.json",
+        root / "graphs" / "artifact_index.json",
+        root / "artifact_index.json",
         root / "prepared" / "graphs" / "index.json",
         root / "graphs" / "index.json",
         root / "index.json",
@@ -552,7 +555,8 @@ def inspect_run(
     split_counts = dict(
         sorted(
             Counter(
-                str(record.get("dataset_split", "unknown")) for record in records
+                str(record.get("split", record.get("dataset_split", "unknown")))
+                for record in records
             ).items()
         )
     )

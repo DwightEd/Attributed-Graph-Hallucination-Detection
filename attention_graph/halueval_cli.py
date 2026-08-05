@@ -182,7 +182,11 @@ def _only_reusable_prepared_artifacts(path: Path) -> bool:
         }:
             continue
         if child.is_file() and (
-            relative == ("prepared", "graphs", "index.json")
+            relative
+            in {
+                ("prepared", "graphs", "index.json"),
+                ("prepared", "graphs", "artifact_index.json"),
+            }
             or (
                 len(relative) == 4
                 and relative[0] == "prepared"

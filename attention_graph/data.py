@@ -26,7 +26,6 @@ from .graph import (
     build_attention_graph,
 )
 
-
 GRAPH_ARTIFACT_SCHEMA = "attention-graph-sparse-channels-v1"
 
 _FORMAL_REQUIRED = frozenset(
@@ -895,7 +894,13 @@ def prepare_graphs(
         if progress_callback is not None:
             progress_callback(current, total)
 
-    _atomic_json(destination / "index.json", [_index_mapping(record) for record in records])
+    # This is an internal artifact inventory, not the semantic dataset index.
+    # Evaluation-aware pipelines may later create a deliberately minimal,
+    # labeled ``index.json`` without overwriting these build diagnostics.
+    _atomic_json(
+        destination / "artifact_index.json",
+        [_index_mapping(record) for record in records],
+    )
     return records
 
 

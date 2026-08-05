@@ -225,6 +225,10 @@ class AttentionGraphDataTests(unittest.TestCase):
                 ),
             )
             graph = load_graph(first[0].graph_path, device="cpu")
+            artifact_index = json.loads(
+                (output / "artifact_index.json").read_text(encoding="utf-8")
+            )
+            legacy_index_exists = (output / "index.json").exists()
 
         self.assertEqual(len(first), 1)
         self.assertEqual(len(second), 1)
@@ -234,6 +238,8 @@ class AttentionGraphDataTests(unittest.TestCase):
         self.assertEqual(graph.trace_channel.shape, graph.trace_value.shape)
         self.assertEqual(first_progress, [(1, 1)])
         self.assertEqual(second_progress, [(1, 1)])
+        self.assertEqual(artifact_index[0]["response_id"], "r1")
+        self.assertFalse(legacy_index_exists)
 
     def test_official_partition_holds_test_out_and_groups_train_by_source(self):
         records = []

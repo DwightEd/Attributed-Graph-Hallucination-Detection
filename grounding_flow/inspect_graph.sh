@@ -26,6 +26,9 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 INDEX_PATH=""
 for candidate in \
+  "${RUN_DIR}/prepared/graphs/artifact_index.json" \
+  "${RUN_DIR}/graphs/artifact_index.json" \
+  "${RUN_DIR}/artifact_index.json" \
   "${RUN_DIR}/prepared/graphs/index.json" \
   "${RUN_DIR}/graphs/index.json" \
   "${RUN_DIR}/index.json"; do
@@ -36,7 +39,7 @@ for candidate in \
 done
 if [[ -z "${INDEX_PATH}" ]]; then
   echo "Prepared graph index is missing under: ${RUN_DIR}" >&2
-  echo "Expected prepared/graphs/index.json, graphs/index.json, or index.json" >&2
+  echo "Expected artifact_index.json (preferred) or a legacy index.json" >&2
   exit 2
 fi
 
