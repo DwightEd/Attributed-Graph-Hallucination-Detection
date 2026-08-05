@@ -162,6 +162,41 @@ OUTPUT_DIR/
 判断依据；真正的无监督拟合是 PCA 与 HMM EM，而 attention rollout/null 统计在
 CUDA 上运行。
 
+## 复用并检查已构建的属性图
+
+`prepared/graphs/{train,test}/*.graph.pt` 是独立于 Grounding Flow detector 的无标签
+图文件。其他方法应通过 `attention_graph.data.load_graph` 复用同一份图，而不是重新
+构图。文件包含节点 self-attention、RP/RR `edge_index`、逐 layer/head 稀疏 trace、
+token identity、构图配置和源 cache fingerprint。
+
+当前 HaluEval 运行可直接检查：
+
+```bash
+bash ./grounding_flow/inspect_graph.sh
+```
+
+指定其他运行或 response：
+
+```bash
+RUN_DIR=/path/to/halueval_grounding_flow_run \
+RESPONSE_ID=response-id \
+TOP_EDGES=30 \
+bash ./grounding_flow/inspect_graph.sh
+```
+
+报告默认写在实验目录旁边的 `<RUN_DIR>.graph_structure.json`，避免给不可变运行目录
+增加文件而影响 `--resume`。报告包括全体图规模分布、tensor shape/dtype、RP/RR
+密度、逐 response target 的入边质量、top edges 及其最强 layer/head。稀疏 cache
+中低于 `attention_floor` 的值未知，因此报告把 edge score 明确标为 retained-attention
+lower bound，而不把它误写成完整 attention 均值。运行目录模式会拒绝索引到目录外的
+图；也可显式检查任意单张图：
+
+```bash
+python -m attention_graph.inspect \
+  --graph /path/to/attention_x.graph.pt \
+  --top-edges 20
+```
+
 ## 当前数据限制
 
 旧 HaluEval pure-attention cache 通常已经按 `tau=0.05` 丢弃小 attention，无法从
