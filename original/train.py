@@ -21,10 +21,12 @@ from transformers import get_cosine_schedule_with_warmup
 from train_charm_grid import CHARM
 
 from .ragtruth_graph import (
+    DATASET_SCHEMA,
     GRAPH_SCHEMA,
     UPSTREAM_COMMIT,
     _atomic_text,
     _atomic_torch_save,
+    validate_original_graph,
 )
 
 TRAINING_SCHEMA = "original-charm-supervised-token-v1"
@@ -38,8 +40,10 @@ def _load_mapping(path: Path) -> Mapping[str, object]:
 
 
 def _graph_to_data(graph: Mapping[str, object], path: Path) -> Data:
-    if graph.get("schema") != GRAPH_SCHEMA:
-        raise ValueError(f"unsupported original graph schema: {path}")
+    try:
+        validate_original_graph(graph)
+    except (KeyError, TypeError, ValueError, RuntimeError) as error:
+        raise ValueError(f"invalid {GRAPH_SCHEMA} artifact {path}: {error}") from error
     x = torch.as_tensor(graph["x"]).detach().float()
     edge_index = torch.as_tensor(graph["edge_index"]).detach().long()
     edge_attr = torch.as_tensor(graph["edge_attr"]).detach().float()
@@ -47,22 +51,7 @@ def _graph_to_data(graph: Mapping[str, object], path: Path) -> Data:
     labels = torch.as_tensor(graph["y_token"]).detach().float().flatten()
     response_idx = int(graph["response_idx"])
     node_count = int(x.shape[0])
-    edge_count = int(edge_index.shape[1]) if edge_index.ndim == 2 else -1
-    valid = (
-        x.ndim == 2
-        and tuple(edge_index.shape) == (2, edge_count)
-        and edge_attr.ndim == 2
-        and edge_attr.shape[0] == edge_count
-        and tuple(edge_mark.shape) == (edge_count, 2)
-        and labels.numel() == node_count
-        and 0 < response_idx < node_count
-    )
-    if not valid:
-        raise ValueError(f"invalid original graph tensor shapes: {path}")
-    if bool((~((labels == 0) | (labels == 1))).any()) or bool(
-        labels[:response_idx].any()
-    ):
-        raise ValueError(f"invalid token labels: {path}")
+    edge_count = int(edge_index.shape[1])
 
     # This deliberately preserves the upstream degree definition, including
     # its source-node normalization convention.
@@ -87,9 +76,7 @@ def _dataset_contract(graph_root: Path) -> tuple[Mapping[str, object], dict[str,
     if not manifest_path.is_file() or not index_path.is_file():
         raise FileNotFoundError("original graph dataset requires manifest.json and index.jsonl")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, Mapping) or manifest.get("schema") != (
-        "original-ragtruth-attributed-graphs-v1"
-    ):
+    if not isinstance(manifest, Mapping) or manifest.get("schema") != DATASET_SCHEMA:
         raise ValueError(f"invalid original graph manifest: {manifest_path}")
     paths_by_split: dict[str, list[Path]] = {"train": [], "test": []}
     observed: set[Path] = set()

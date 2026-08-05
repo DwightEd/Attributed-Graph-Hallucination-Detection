@@ -10,7 +10,6 @@ from pathlib import Path
 from attention_graph.data import audit_attention_cache
 
 from .ragtruth_graph import inspect_original_graph, prepare_original_graphs
-from .train import run_training
 
 
 def _build(args: argparse.Namespace) -> int:
@@ -53,6 +52,8 @@ def _build(args: argparse.Namespace) -> int:
 
 
 def _train(args: argparse.Namespace) -> int:
+    from .train import run_training
+
     summary = run_training(
         graph_root=args.graph_root,
         output_dir=args.output_dir,

@@ -23,7 +23,8 @@ from attention_graph.data import (
 )
 
 FORMAL_CACHE_SCHEMA = "ragtruth-all-layers-all-heads-sparse-response-csr-v1"
-GRAPH_SCHEMA = "original-ragtruth-attributed-graph-v1"
+GRAPH_SCHEMA = "original-ragtruth-attributed-graph-v2"
+DATASET_SCHEMA = "original-ragtruth-attributed-graphs-v2"
 GRAPH_METADATA_SCHEMA = "original-ragtruth-attributed-graph-metadata-v1"
 UPSTREAM_COMMIT = "13e907693aa954bf070e809d8afecdf26b3b88d8"
 
@@ -34,7 +35,8 @@ GRAPH_FIELD_SCHEMA: dict[str, dict[str, object]] = {
     "response_idx": {
         "type": "int",
         "meaning": "first response node; nodes before it are prompt tokens",
-        "model_input": True,
+        "model_input": False,
+        "training_mask": True,
     },
     "token_ids": {
         "shape": "[N]",
@@ -61,7 +63,8 @@ GRAPH_FIELD_SCHEMA: dict[str, dict[str, object]] = {
         "coordinate": "global prompt-then-response token index",
         "encoding": {"0": "non-hallucinated", "1": "hallucinated"},
         "constraint": "prompt entries are always 0",
-        "model_input": "supervised response-token target",
+        "model_input": False,
+        "training_target": True,
     },
     "edge_index": {
         "shape": "[2, E]",
@@ -90,6 +93,35 @@ GRAPH_FIELD_SCHEMA: dict[str, dict[str, object]] = {
         "model_input": False,
     },
 }
+
+
+def _graph_metadata(
+    *,
+    layers: int,
+    heads: int,
+    input_policy: str,
+    cache_dtype: str,
+) -> dict[str, object]:
+    return {
+        "schema": GRAPH_METADATA_SCHEMA,
+        "num_attention_layers": layers,
+        "num_attention_heads": heads,
+        "num_attention_channels": layers * heads,
+        "channel_order": "layer_major_head_minor",
+        "channel_index_formula": "channel = layer * num_attention_heads + head",
+        "edge_direction": "source_key_to_target_query",
+        "edge_selection": (
+            "edge iff any attention[layer, head, target, source] > tau; "
+            "channels <= tau are stored as zero"
+        ),
+        "relation_encoding": {"RP": [1.0, 0.0], "RR": [0.0, 1.0]},
+        "node_role_encoding": {"prompt": 0, "response": 1},
+        "label_coordinate": "global_prompt_then_response_token_index",
+        "label_encoding": {"non_hallucinated": 0, "hallucinated": 1},
+        "label_source": "RAGTruth y_token from the formal attention cache",
+        "input_policy": input_policy,
+        "source_cache_dtype": cache_dtype,
+    }
 
 
 def _scalar_int(value: object, name: str) -> int:
@@ -125,8 +157,8 @@ def build_original_graph(
         attention_floor = float(sample["attention_floor"])
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("tau and attention floor must be finite scalars") from error
-    if not math.isfinite(threshold) or threshold <= 0:
-        raise ValueError("tau must be a positive finite scalar")
+    if not math.isfinite(threshold) or not 0 < threshold <= 1:
+        raise ValueError("tau must be a finite scalar in (0, 1]")
     if not math.isfinite(attention_floor) or not 0 < attention_floor <= 1:
         raise ValueError("attention floor must be finite in (0, 1]")
     if threshold < attention_floor:
@@ -147,11 +179,14 @@ def build_original_graph(
         raise ValueError("response_idx must split non-empty prompt and response")
 
     token_ids = torch.as_tensor(sample["token_ids"], device=device).flatten().long()
-    labels = torch.as_tensor(sample["y_token"], device=device).flatten().long()
-    if token_ids.numel() != token_count or labels.numel() != token_count:
+    raw_labels = torch.as_tensor(sample["y_token"], device=device).flatten()
+    if token_ids.numel() != token_count or raw_labels.numel() != token_count:
         raise ValueError("token_ids and y_token must contain one value per node")
-    if bool((~((labels == 0) | (labels == 1))).any()):
+    if not bool(torch.isfinite(raw_labels).all()) or bool(
+        (~((raw_labels == 0) | (raw_labels == 1))).any()
+    ):
         raise ValueError("y_token must be binary")
+    labels = raw_labels.long()
     if bool(labels[:response_idx].any()):
         raise ValueError("prompt tokens cannot carry hallucination labels")
 
@@ -244,28 +279,12 @@ def build_original_graph(
         "response_label": int(labels[response_idx:].any().item()),
         "tau": threshold,
         "attention_floor": attention_floor,
-        "metadata": {
-            "schema": GRAPH_METADATA_SCHEMA,
-            "num_attention_layers": layers,
-            "num_attention_heads": heads,
-            "num_attention_channels": channels,
-            "channel_order": "layer_major_head_minor",
-            "channel_index_formula": (
-                "channel = layer * num_attention_heads + head"
-            ),
-            "edge_direction": "source_key_to_target_query",
-            "edge_selection": (
-                "edge iff any attention[layer, head, target, source] > tau; "
-                "channels <= tau are stored as zero"
-            ),
-            "relation_encoding": {"RP": [1.0, 0.0], "RR": [0.0, 1.0]},
-            "node_role_encoding": {"prompt": 0, "response": 1},
-            "label_coordinate": "global_prompt_then_response_token_index",
-            "label_encoding": {"non_hallucinated": 0, "hallucinated": 1},
-            "label_source": "RAGTruth y_token from the formal attention cache",
-            "input_policy": str(sample.get("input_policy", "")),
-            "source_cache_dtype": str(sample.get("cache_dtype", "")),
-        },
+        "metadata": _graph_metadata(
+            layers=layers,
+            heads=heads,
+            input_policy=str(sample.get("input_policy", "")),
+            cache_dtype=str(sample.get("cache_dtype", "")),
+        ),
     }
 
 
@@ -350,7 +369,7 @@ def validate_original_graph(graph: Mapping[str, object]) -> None:
     token_ids = torch.as_tensor(graph["token_ids"])
     node_role = torch.as_tensor(graph["node_role"])
     node_attr = torch.as_tensor(graph["x"])
-    labels = torch.as_tensor(graph["y_token"]).flatten()
+    labels = torch.as_tensor(graph["y_token"])
     edge_index = torch.as_tensor(graph["edge_index"])
     edge_attr = torch.as_tensor(graph["edge_attr"])
     edge_mark = torch.as_tensor(graph["edge_mark"])
@@ -371,6 +390,38 @@ def validate_original_graph(graph: Mapping[str, object]) -> None:
     )
     if not valid_shapes:
         raise ValueError("original graph tensor shapes are inconsistent")
+    expected_dtypes = {
+        "token_ids": (token_ids.dtype, torch.int64),
+        "node_role": (node_role.dtype, torch.int8),
+        "x": (node_attr.dtype, torch.float32),
+        "edge_index": (edge_index.dtype, torch.int64),
+        "edge_attr": (edge_attr.dtype, torch.float32),
+        "edge_mark": (edge_mark.dtype, torch.float32),
+        "y_token": (labels.dtype, torch.int64),
+    }
+    wrong_dtypes = [
+        f"{name}={actual} (expected {expected})"
+        for name, (actual, expected) in expected_dtypes.items()
+        if actual != expected
+    ]
+    if wrong_dtypes:
+        raise ValueError("original graph tensor dtype mismatch: " + ", ".join(wrong_dtypes))
+    identities = {
+        name: str(graph[name]).strip()
+        for name in ("source_id", "response_id", "sample_id")
+    }
+    if not all(identities.values()) or identities["sample_id"] != identities["response_id"]:
+        raise ValueError("graph identities must be non-empty and sample_id=response_id")
+    if str(graph["split"]).strip().casefold() not in {"train", "test"}:
+        raise ValueError("graph split must be train or test")
+    tau = float(graph["tau"])
+    attention_floor = float(graph["attention_floor"])
+    if not (
+        math.isfinite(tau)
+        and math.isfinite(attention_floor)
+        and 0 < attention_floor <= tau <= 1
+    ):
+        raise ValueError("graph requires 0 < attention_floor <= tau <= 1")
     expected_role = (torch.arange(node_count) >= response_idx).to(node_role.dtype)
     if not torch.equal(node_role.cpu(), expected_role):
         raise ValueError("node_role does not match response_idx")
@@ -399,11 +450,18 @@ def validate_original_graph(graph: Mapping[str, object]) -> None:
         )
         if not valid_edges:
             raise ValueError("edge_index violates causal RP/RR graph constraints")
+        pair_keys = source * node_count + target
+        if torch.unique(pair_keys).numel() != edge_count:
+            raise ValueError("edge_index contains duplicate token-pair edges")
         expected_mark = torch.nn.functional.one_hot(
             (source >= response_idx).long(), num_classes=2
         ).to(dtype=edge_mark.dtype)
         if not torch.equal(edge_mark.cpu(), expected_mark.cpu()):
             raise ValueError("edge_mark does not match RP/RR source roles")
+        supported = (edge_attr > tau).any(dim=1)
+        censored = (edge_attr > 0) & (edge_attr <= tau)
+        if not bool(supported.all()) or bool(censored.any()):
+            raise ValueError("each edge_attr needs >tau support and zeroed <=tau channels")
 
     metadata = graph["metadata"]
     if not isinstance(metadata, Mapping) or metadata.get("schema") != (
@@ -415,8 +473,16 @@ def validate_original_graph(graph: Mapping[str, object]) -> None:
     channels = int(metadata.get("num_attention_channels", 0))
     if layers < 1 or heads < 1 or channels != layers * heads or channels != channel_count:
         raise ValueError("graph layer/head metadata does not match feature channels")
-    if metadata.get("channel_order") != "layer_major_head_minor":
-        raise ValueError("unsupported attention channel order")
+    input_policy = str(metadata.get("input_policy", "")).strip()
+    cache_dtype = str(metadata.get("source_cache_dtype", "")).strip()
+    expected_metadata = _graph_metadata(
+        layers=layers,
+        heads=heads,
+        input_policy=input_policy,
+        cache_dtype=cache_dtype,
+    )
+    if not input_policy or not cache_dtype or dict(metadata) != expected_metadata:
+        raise ValueError("graph metadata does not match the declared field semantics")
 
 
 def load_original_graph(path: str | Path) -> dict[str, object]:
@@ -438,20 +504,19 @@ def inspect_original_graph(
 
     if max_nodes < 0 or max_edges < 0:
         raise ValueError("max_nodes and max_edges cannot be negative")
-    graph = (
-        load_original_graph(graph_or_path)
-        if isinstance(graph_or_path, (str, Path))
-        else dict(graph_or_path)
-    )
-    validate_original_graph(graph)
+    if isinstance(graph_or_path, (str, Path)):
+        graph = load_original_graph(graph_or_path)
+    else:
+        graph = dict(graph_or_path)
+        validate_original_graph(graph)
 
-    token_ids = torch.as_tensor(graph["token_ids"]).cpu()
-    node_role = torch.as_tensor(graph["node_role"]).cpu()
-    node_attr = torch.as_tensor(graph["x"]).cpu()
-    labels = torch.as_tensor(graph["y_token"]).cpu()
-    edge_index = torch.as_tensor(graph["edge_index"]).cpu()
-    edge_attr = torch.as_tensor(graph["edge_attr"]).cpu()
-    edge_mark = torch.as_tensor(graph["edge_mark"]).cpu()
+    token_ids = torch.as_tensor(graph["token_ids"])
+    node_role = torch.as_tensor(graph["node_role"])
+    node_attr = torch.as_tensor(graph["x"])
+    labels = torch.as_tensor(graph["y_token"])
+    edge_index = torch.as_tensor(graph["edge_index"])
+    edge_attr = torch.as_tensor(graph["edge_attr"])
+    edge_mark = torch.as_tensor(graph["edge_mark"])
     metadata = dict(graph["metadata"])
     response_idx = int(graph["response_idx"])
     node_count = int(token_ids.numel())
@@ -465,29 +530,38 @@ def inspect_original_graph(
             "dtype": str(value.dtype).removeprefix("torch."),
         }
 
+    preview_nodes = min(max_nodes, node_count)
+    preview_token_ids = token_ids[:preview_nodes].detach().cpu()
+    preview_node_role = node_role[:preview_nodes].detach().cpu()
+    preview_labels = labels[:preview_nodes].detach().cpu()
+    preview_node_attr = node_attr[:preview_nodes].detach().cpu()
     node_preview = []
-    for node_index in range(min(max_nodes, node_count)):
+    for node_index in range(preview_nodes):
         node_preview.append(
             {
                 "node_index": node_index,
-                "token_id": int(token_ids[node_index]),
-                "role": "response" if int(node_role[node_index]) else "prompt",
-                "y_token": int(labels[node_index]),
-                "x": node_attr[node_index].tolist(),
+                "token_id": int(preview_token_ids[node_index]),
+                "role": "response" if int(preview_node_role[node_index]) else "prompt",
+                "y_token": int(preview_labels[node_index]),
+                "x": preview_node_attr[node_index].tolist(),
             }
         )
+    preview_edges = min(max_edges, edge_count)
+    preview_edge_index = edge_index[:, :preview_edges].detach().cpu()
+    preview_edge_attr = edge_attr[:preview_edges].detach().cpu()
+    preview_edge_mark = edge_mark[:preview_edges].detach().cpu()
     edge_preview = []
-    for edge_id in range(min(max_edges, edge_count)):
-        source = int(edge_index[0, edge_id])
-        target = int(edge_index[1, edge_id])
+    for edge_id in range(preview_edges):
+        source = int(preview_edge_index[0, edge_id])
+        target = int(preview_edge_index[1, edge_id])
         edge_preview.append(
             {
                 "edge_id": edge_id,
                 "source": source,
                 "target": target,
-                "relation": "RP" if int(edge_mark[edge_id, 0]) else "RR",
-                "edge_mark": edge_mark[edge_id].tolist(),
-                "attention_by_channel": edge_attr[edge_id].tolist(),
+                "relation": "RP" if int(preview_edge_mark[edge_id, 0]) else "RR",
+                "edge_mark": preview_edge_mark[edge_id].tolist(),
+                "attention_by_channel": preview_edge_attr[edge_id].tolist(),
             }
         )
 
@@ -514,6 +588,14 @@ def inspect_original_graph(
         "labels": {
             "hallucinated_response_tokens": int(labels[response_idx:].sum().item()),
             "response_label": int(graph["response_label"]),
+        },
+        "construction": {
+            "tau": float(graph["tau"]),
+            "attention_floor": float(graph["attention_floor"]),
+            "upstream_commit": str(graph.get("upstream_commit", "")),
+            "attention_cache_fingerprint": str(
+                graph.get("attention_cache_fingerprint", "")
+            ),
         },
         "tensors": {
             name: tensor_description(torch.as_tensor(graph[name]))
@@ -543,38 +625,14 @@ def _graph_matches_source(
     tau: float,
 ) -> bool:
     try:
-        required = {
-            "x",
-            "edge_index",
-            "edge_attr",
-            "edge_mark",
-            "token_ids",
-            "node_role",
-            "y_token",
-            "metadata",
-        }
-        if not required.issubset(graph):
-            return False
-        node_count = int(torch.as_tensor(graph["token_ids"]).numel())
-        edge_count = int(torch.as_tensor(graph["edge_index"]).shape[1])
-        valid_shapes = (
-            torch.as_tensor(graph["x"]).ndim == 2
-            and int(torch.as_tensor(graph["x"]).shape[0]) == node_count
-            and torch.as_tensor(graph["y_token"]).numel() == node_count
-            and torch.as_tensor(graph["node_role"]).numel() == node_count
-            and tuple(torch.as_tensor(graph["edge_index"]).shape) == (2, edge_count)
-            and int(torch.as_tensor(graph["edge_attr"]).shape[0]) == edge_count
-            and tuple(torch.as_tensor(graph["edge_mark"]).shape) == (edge_count, 2)
-        )
+        validate_original_graph(graph)
         return bool(
-            graph.get("schema") == GRAPH_SCHEMA
-            and float(graph.get("tau", float("nan"))) == float(tau)
+            float(graph.get("tau", float("nan"))) == float(tau)
             and str(graph.get("source_cache_path", "")) == str(cache_path)
             and int(graph.get("source_cache_size", -1)) == cache_size
             and int(graph.get("source_cache_mtime_ns", -1)) == cache_mtime_ns
-            and valid_shapes
         )
-    except (KeyError, TypeError, ValueError, IndexError):
+    except (KeyError, TypeError, ValueError, IndexError, RuntimeError):
         return False
 
 
@@ -718,7 +776,7 @@ def prepare_original_graphs(
         split: sum(row["split"] == split for row in index) for split in requested_splits
     }
     manifest = {
-        "schema": "original-ragtruth-attributed-graphs-v1",
+        "schema": DATASET_SCHEMA,
         "graph_schema": GRAPH_SCHEMA,
         "upstream_repository": (
             "https://github.com/liuzhishun/Attributed-Graph-Hallucination-Detection"

@@ -12,13 +12,14 @@ from original.train import run_training
 
 def _graph(response_id: str, label: int) -> dict[str, object]:
     return {
-        "schema": "original-ragtruth-attributed-graph-v1",
+        "schema": "original-ragtruth-attributed-graph-v2",
         "source_id": f"source-{response_id}",
         "response_id": response_id,
         "sample_id": response_id,
         "split": "train",
         "response_idx": 2,
         "token_ids": torch.tensor([10, 11, 12]),
+        "node_role": torch.tensor([0, 0, 1], dtype=torch.int8),
         "x": torch.tensor(
             [[0.10, 0.20], [0.20, 0.10], [0.80, 0.70] if label else [0.15, 0.10]]
         ),
@@ -27,6 +28,28 @@ def _graph(response_id: str, label: int) -> dict[str, object]:
         "edge_mark": torch.tensor([[1.0, 0.0], [1.0, 0.0]]),
         "y_token": torch.tensor([0, 0, label], dtype=torch.long),
         "response_label": label,
+        "tau": 0.05,
+        "attention_floor": 0.01,
+        "metadata": {
+            "schema": "original-ragtruth-attributed-graph-metadata-v1",
+            "num_attention_layers": 1,
+            "num_attention_heads": 2,
+            "num_attention_channels": 2,
+            "channel_order": "layer_major_head_minor",
+            "channel_index_formula": "channel = layer * num_attention_heads + head",
+            "edge_direction": "source_key_to_target_query",
+            "edge_selection": (
+                "edge iff any attention[layer, head, target, source] > tau; "
+                "channels <= tau are stored as zero"
+            ),
+            "relation_encoding": {"RP": [1.0, 0.0], "RR": [0.0, 1.0]},
+            "node_role_encoding": {"prompt": 0, "response": 1},
+            "label_coordinate": "global_prompt_then_response_token_index",
+            "label_encoding": {"non_hallucinated": 0, "hallucinated": 1},
+            "label_source": "RAGTruth y_token from the formal attention cache",
+            "input_policy": "unit_test",
+            "source_cache_dtype": "float32",
+        },
     }
 
 
@@ -64,7 +87,7 @@ class OriginalTrainerTests(unittest.TestCase):
             (graph_root / "manifest.json").write_text(
                 json.dumps(
                     {
-                        "schema": "original-ragtruth-attributed-graphs-v1",
+                        "schema": "original-ragtruth-attributed-graphs-v2",
                         "experiment_scope": "unit_test_fixture",
                         "tau": 0.05,
                     }
@@ -111,7 +134,7 @@ class OriginalTrainerTests(unittest.TestCase):
             (graph_root / "manifest.json").write_text(
                 json.dumps(
                     {
-                        "schema": "original-ragtruth-attributed-graphs-v1",
+                        "schema": "original-ragtruth-attributed-graphs-v2",
                         "experiment_scope": "partial_cache",
                         "tau": 0.05,
                     }

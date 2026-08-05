@@ -38,15 +38,105 @@ bash ./original/run_ragtruth_original.sh
         summary.json
 ```
 
+补齐 attention 时，辅助程序仍需要一个临时承载 replay hypergraph 的目录。它固定
+使用 `RAGTruth/hypergraphs/cache_bound_sha256/<cache_tag>/`，不会复用旧的
+`fresh_hypergraphs_*`。旧图没有当前校验器要求的 `attention_cache_sha256`，而
+`--resume-existing` 只复用通过当前校验的图，并不负责升级旧 schema。这个隔离
+只会从已有 attention cache 快速重建辅助图，不会删除 cache，也不会对已有样本
+重新执行 teacher forcing。
+
 再次运行时，来源 cache、`tau`、大小和修改时间均一致的 `.graph.pt` 会直接
-复用。每张图包含：
+复用。现有 attention cache 就是构图输入，不需要重新运行大模型；已有 v2
+`.graph.pt` 也可以脱离 cache 直接加载和训练。新格式的 schema 是
+`original-ragtruth-attributed-graph-v2`；旧 v1 图缺少 L/H、通道顺序和节点角色，
+不会与 v2 静默混用。
+
+## 图如何构造
+
+记：
+
+- `N`：拼接后的 prompt + response token 数；
+- `L`：attention 层数；
+- `H`：每层 attention head 数；
+- `C=L×H`：逐层逐头通道数，`channel=layer×H+head`；
+- `E`：最终 token-pair 边数。
+
+节点按原序列排列：`[0,response_idx)` 是 prompt，`[response_idx,N)` 是
+response。每个 token 是一个节点。节点字段如下：
+
+| 字段 | shape / dtype | 含义 | CHARM 使用 |
+|---|---|---|---|
+| `token_ids` | `[N] / int64` | 每个节点的 tokenizer token ID | 否 |
+| `node_role` | `[N] / int8` | `0=prompt, 1=response` | 否，仅供分析 |
+| `x` | `[N,C] / float32` | `x[i,c]=attention[layer,head,i,i]`，即逐层逐头 self-attention | 是，节点属性 |
+| `y_token` | `[N] / int64` | `0=非幻觉，1=幻觉`；使用全序列 token 下标，prompt 区间强制为 0 | 是，仅作为 response-token 监督标签 |
+
+`token_ids[i]`、`node_role[i]`、`x[i]` 和 `y_token[i]` 永远描述同一个节点。
+构图时若 cache 没有 `y_token`，代码会直接报错，不会生成无标签图。
+
+边按 causal attention 的实际方向保存：
 
 ```text
-token_ids, response_idx, x, edge_index, edge_attr, edge_mark, y_token
+edge_index[0, e] = source/key（被关注的历史 token）
+edge_index[1, e] = target/query（发出 attention 的 response token）
 ```
 
-其中 `token_ids[i]`、`x[i]` 和 `y_token[i]` 对应同一个 token；`edge_mark`
-的 `[1,0]` 是 prompt→response，`[0,1]` 是 response→response。
+只考察 `source < target` 且 target 是 response 的 token 对，因此没有
+prompt→prompt 边。对每个候选 `(source,target)`：只要任意 layer/head 满足
+`attention[layer,head,target,source] > tau` 就建立一条边。默认 `tau=0.05`，
+比较是严格的大于，不是平均 attention，也不是 top-k。
+
+| 字段 | shape / dtype | 含义 | CHARM 使用 |
+|---|---|---|---|
+| `edge_index` | `[2,E] / int64` | 每列是 `[source,target]` | 是，消息传递拓扑 |
+| `edge_attr` | `[E,C] / float32` | 同一边的逐层逐头 attention；`>tau` 保留，否则为 0 | 是，边属性 |
+| `edge_mark` | `[E,2] / float32` | `RP=[1,0]`，`RR=[0,1]` | 是，关系属性 |
+
+其中 RP 是 prompt→response，RR 是历史 response→当前 response。没有跨 head
+池化：`x` 和 `edge_attr` 都保留全部 `L×H` 通道。
+
+每张图还包含以下图级字段：
+
+| 字段 | 含义 |
+|---|---|
+| `schema` | 图格式版本 |
+| `source_id`, `response_id`, `sample_id`, `split` | 与 RAGTruth 原样本及 train/test 的关联键 |
+| `response_idx` | 第一个 response 节点的全局下标 |
+| `response_label` | `any(y_token[response_idx:])`，只用于统计 |
+| `tau`, `attention_floor` | 构图阈值与 sparse cache 保存下限 |
+| `metadata` | L/H/C、通道顺序、边方向、RP/RR 编码、标签语义和 cache dtype |
+| `upstream_commit` | 对齐的原项目 commit |
+| `source_cache_path/size/mtime` | 安全 resume 使用的来源记录 |
+| `attention_cache_fingerprint` | attention cache 内容身份 |
+
+同样的机器可读字段规范也保存在数据集根目录的 `manifest.json` →
+`graph_fields` 中；`index.jsonl` 只负责把样本身份、split 和相对 graph path
+对应起来。
+
+## 复用和查看图
+
+Python 中直接安全加载一张图：
+
+```python
+from original import load_original_graph
+
+graph = load_original_graph("/path/to/attention_xxx.graph.pt")
+print(graph["x"].shape, graph["edge_index"].shape, graph["y_token"].shape)
+```
+
+查看一张图的字段、统计以及前几个节点/边：
+
+```bash
+python -m original.cli inspect \
+  --graph /path/to/attention_xxx.graph.pt \
+  --max-nodes 3 \
+  --max-edges 3
+```
+
+输出是单个 JSON，可以直接保存或交给后续分析脚本。若稳定目录中存在此前
+生成、但缺少上述自描述 metadata 的 v1 图，再次执行 build 会从现有 attention
+cache 将它重建为 v2；不会重新跑模型提取 attention。训练入口同样只接受 v2，
+从而保证 build、inspect 和 train 使用完全相同的数据契约。
 
 只构图、不训练：
 

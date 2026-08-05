@@ -17,12 +17,11 @@ MODEL_PATH="${MODEL_PATH:-/share/home/tm902089733300000/a903202310/lys/models/Me
 HYPERGRAPH_PROJECT="${HYPERGRAPH_PROJECT:-/share/home/tm902089733300000/a903202310/lys/research/Unsupervised-hypergraph}"
 ATTENTION_CACHE_ROOT="${ATTENTION_CACHE_ROOT:?Set ATTENTION_CACHE_ROOT}"
 CACHE_TAG="$(basename -- "${ATTENTION_CACHE_ROOT}")"
-if [[ "${CACHE_TAG}" == fresh_attention_* ]]; then
-  HYPERGRAPH_TAG="fresh_hypergraphs_${CACHE_TAG#fresh_attention_}"
-else
-  HYPERGRAPH_TAG="replay_hypergraphs_${CACHE_TAG}"
-fi
-REPLAY_GRAPH_ROOT="${REPLAY_GRAPH_ROOT:-${DATA_ROOT}/RAGTruth/hypergraphs/${HYPERGRAPH_TAG}}"
+# The legacy fresh_hypergraphs_* files predate the mandatory cache SHA-256
+# binding.  Reusing them makes the current validator fail before it can resume
+# the attention cache, so cache-bound replay artifacts have their own stable
+# schema-specific directory.  Existing attention_*.pt files remain untouched.
+REPLAY_GRAPH_ROOT="${REPLAY_GRAPH_ROOT:-${DATA_ROOT}/RAGTruth/hypergraphs/cache_bound_sha256/${CACHE_TAG}}"
 REPLAY_GRAPH_DIR="${REPLAY_GRAPH_DIR:-${REPLAY_GRAPH_ROOT}/${SPLIT}}"
 LOG_DIR="${LOG_DIR:-${DATA_ROOT}/feature_extraction/ragtruth_original_attribute_graphs/logs/${CACHE_TAG}}"
 

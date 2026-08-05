@@ -20,6 +20,7 @@ from original.ragtruth_graph import (
     build_original_graph,
     inspect_original_graph,
     prepare_original_graphs,
+    validate_original_graph,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -196,12 +197,67 @@ class OriginalRagTruthGraphTests(unittest.TestCase):
     def test_graph_preserves_token_labels_and_dataset_identity(self):
         graph = build_original_graph(_formal_sparse_fixture(split="test"), tau=0.05)
 
+        self.assertEqual(graph["schema"], "original-ragtruth-attributed-graph-v2")
         self.assertEqual(graph["source_id"], "source-17")
         self.assertEqual(graph["response_id"], "response-23")
         self.assertEqual(graph["split"], "test")
         self.assertEqual(graph["y_token"].dtype, torch.long)
         self.assertEqual(graph["y_token"].tolist(), [0, 0, 0, 1, 1])
         self.assertEqual(graph["token_ids"].tolist(), [101, 102, 201, 202, 203])
+
+    def test_validator_enforces_declared_tensor_and_metadata_contract(self):
+        graph = build_original_graph(_formal_sparse_fixture(), tau=0.05)
+
+        wrong_label_shape = dict(graph)
+        wrong_label_shape["y_token"] = graph["y_token"].reshape(-1, 1)
+        with self.assertRaisesRegex(ValueError, "shape|y_token"):
+            validate_original_graph(wrong_label_shape)
+
+        wrong_dtype = dict(graph)
+        wrong_dtype["token_ids"] = graph["token_ids"].to(torch.int32)
+        with self.assertRaisesRegex(ValueError, "dtype|int64"):
+            validate_original_graph(wrong_dtype)
+
+        wrong_metadata = dict(graph)
+        wrong_metadata["metadata"] = {
+            **graph["metadata"],
+            "edge_direction": "target_to_source",
+        }
+        with self.assertRaisesRegex(ValueError, "metadata|edge_direction"):
+            validate_original_graph(wrong_metadata)
+
+        missing_support = dict(graph)
+        missing_support["edge_attr"] = graph["edge_attr"].clone()
+        missing_support["edge_attr"][0].zero_()
+        with self.assertRaisesRegex(ValueError, "edge_attr|tau|support"):
+            validate_original_graph(missing_support)
+
+        duplicate_edge = dict(graph)
+        duplicate_edge["edge_index"] = torch.cat(
+            [graph["edge_index"], graph["edge_index"][:, :1]], dim=1
+        )
+        duplicate_edge["edge_attr"] = torch.cat(
+            [graph["edge_attr"], graph["edge_attr"][:1]], dim=0
+        )
+        duplicate_edge["edge_mark"] = torch.cat(
+            [graph["edge_mark"], graph["edge_mark"][:1]], dim=0
+        )
+        with self.assertRaisesRegex(ValueError, "duplicate|unique"):
+            validate_original_graph(duplicate_edge)
+
+    def test_builder_rejects_fractional_labels_before_integer_conversion(self):
+        sample = _formal_sparse_fixture()
+        sample["y_token"] = torch.tensor([0.0, 0.0, 0.5, 1.0, 1.0])
+
+        with self.assertRaisesRegex(ValueError, "binary|y_token"):
+            build_original_graph(sample, tau=0.05)
+
+    def test_validator_rejects_legacy_v1_instead_of_silently_mixing_formats(self):
+        legacy = build_original_graph(_formal_sparse_fixture(), tau=0.05)
+        legacy["schema"] = "original-ragtruth-attributed-graph-v1"
+
+        with self.assertRaisesRegex(ValueError, "schema|v1"):
+            validate_original_graph(legacy)
 
     def test_graph_is_self_describing_without_reopening_the_attention_cache(self):
         graph = build_original_graph(_formal_sparse_fixture(), tau=0.05)
@@ -324,6 +380,33 @@ class OriginalRagTruthGraphTests(unittest.TestCase):
         self.assertEqual(len(report["node_preview"]), 1)
         self.assertEqual(len(report["edge_preview"]), 1)
 
+    def test_inspect_accepts_a_valid_graph_with_no_selected_edges(self):
+        sample = _formal_sparse_fixture()
+        sample["response_values"] = torch.full_like(sample["response_values"], 0.01)
+        graph = build_original_graph(sample, tau=0.05)
+
+        report = inspect_original_graph(graph)
+
+        self.assertEqual(graph["edge_index"].shape, (2, 0))
+        self.assertEqual(report["dimensions"]["edges"], 0)
+        self.assertEqual(report["dimensions"]["rp_edges"], 0)
+        self.assertEqual(report["dimensions"]["rr_edges"], 0)
+        self.assertEqual(report["edge_preview"], [])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_inspect_accepts_a_cuda_mapping_and_returns_json_safe_previews(self):
+        graph = build_original_graph(_formal_sparse_fixture(), tau=0.05)
+        cuda_graph = {
+            key: value.cuda() if torch.is_tensor(value) else value
+            for key, value in graph.items()
+        }
+
+        report = inspect_original_graph(cuda_graph, max_nodes=1, max_edges=1)
+
+        json.dumps(report)
+        self.assertEqual(len(report["node_preview"]), 1)
+        self.assertEqual(len(report["edge_preview"]), 1)
+
     def test_prepare_persists_labeled_graph_manifest_and_reuses_valid_output(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -363,7 +446,7 @@ class OriginalRagTruthGraphTests(unittest.TestCase):
             ]
 
         self.assertEqual(second_mtime, first_mtime)
-        self.assertEqual(manifest["schema"], "original-ragtruth-attributed-graphs-v1")
+        self.assertEqual(manifest["schema"], "original-ragtruth-attributed-graphs-v2")
         self.assertEqual(manifest["tau"], 0.05)
         self.assertEqual(manifest["graph_count"], 1)
         self.assertEqual(manifest["graph_fields"]["x"]["shape"], "[N, C]")
@@ -385,6 +468,35 @@ class OriginalRagTruthGraphTests(unittest.TestCase):
         )
         self.assertIn("y_token", graph)
         self.assertEqual(graph["y_token"].tolist(), [0, 0, 0, 1, 1])
+
+    def test_prepare_rebuilds_a_matching_but_structurally_corrupt_saved_graph(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache_root = root / "cache"
+            output_root = root / "prepared"
+            (cache_root / "train").mkdir(parents=True)
+            torch.save(
+                _formal_sparse_fixture(),
+                cache_root / "train" / "attention_fixture.pt",
+            )
+            prepare_original_graphs(cache_root, output_root, tau=0.05)
+            graph_path = (
+                output_root / "graphs" / "train" / "attention_fixture.graph.pt"
+            )
+            corrupt = torch.load(graph_path, map_location="cpu", weights_only=True)
+            corrupt["edge_mark"][0] = torch.tensor([0.0, 1.0])
+            torch.save(corrupt, graph_path)
+
+            records = prepare_original_graphs(
+                cache_root,
+                output_root,
+                tau=0.05,
+                resume=True,
+            )
+            repaired = torch.load(graph_path, map_location="cpu", weights_only=True)
+
+        self.assertEqual(records[0]["state"], "rebuilt")
+        self.assertEqual(repaired["edge_mark"][0].tolist(), [1.0, 0.0])
 
 
 class OriginalRunnerContractTests(unittest.TestCase):
@@ -409,14 +521,14 @@ class OriginalRunnerContractTests(unittest.TestCase):
         for unstable_fragment in ("date ", "TIMESTAMP", "RUN_ID", "RANDOM", "mktemp"):
             self.assertNotIn(unstable_fragment, graph_defaults[0])
 
-    def test_attention_resume_reuses_the_corresponding_hypergraph_directory(self):
+    def test_attention_resume_isolates_cache_bound_graphs_from_legacy_graphs(self):
         helper = (ROOT / "original" / "prepare_attention_split.sh").read_text(
             encoding="utf-8"
         )
 
-        self.assertIn("fresh_hypergraphs_", helper)
+        self.assertIn("cache_bound_sha256", helper)
         self.assertIn("RAGTruth/hypergraphs", helper)
-        self.assertNotIn("attention_preparation", helper)
+        self.assertNotIn('HYPERGRAPH_TAG="fresh_hypergraphs_', helper)
 
 
 if __name__ == "__main__":
