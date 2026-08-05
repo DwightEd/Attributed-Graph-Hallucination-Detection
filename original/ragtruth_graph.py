@@ -24,7 +24,72 @@ from attention_graph.data import (
 
 FORMAL_CACHE_SCHEMA = "ragtruth-all-layers-all-heads-sparse-response-csr-v1"
 GRAPH_SCHEMA = "original-ragtruth-attributed-graph-v1"
+GRAPH_METADATA_SCHEMA = "original-ragtruth-attributed-graph-metadata-v1"
 UPSTREAM_COMMIT = "13e907693aa954bf070e809d8afecdf26b3b88d8"
+
+# JSON-safe field definitions are written once to the dataset manifest.  Each
+# graph carries the concrete layer/head dimensions and encodings in metadata,
+# so a copied graph remains interpretable without reopening its attention cache.
+GRAPH_FIELD_SCHEMA: dict[str, dict[str, object]] = {
+    "response_idx": {
+        "type": "int",
+        "meaning": "first response node; nodes before it are prompt tokens",
+        "model_input": True,
+    },
+    "token_ids": {
+        "shape": "[N]",
+        "dtype": "int64",
+        "meaning": "token id at each global prompt-then-response node index",
+        "model_input": False,
+    },
+    "node_role": {
+        "shape": "[N]",
+        "dtype": "int8",
+        "encoding": {"0": "prompt", "1": "response"},
+        "model_input": False,
+    },
+    "x": {
+        "shape": "[N, C]",
+        "dtype": "float32",
+        "value": "attention[layer, head, token, token]",
+        "channel": "C=L*H; channel=layer*H+head",
+        "model_input": True,
+    },
+    "y_token": {
+        "shape": "[N]",
+        "dtype": "int64",
+        "coordinate": "global prompt-then-response token index",
+        "encoding": {"0": "non-hallucinated", "1": "hallucinated"},
+        "constraint": "prompt entries are always 0",
+        "model_input": "supervised response-token target",
+    },
+    "edge_index": {
+        "shape": "[2, E]",
+        "dtype": "int64",
+        "rows": {"0": "source/key token", "1": "target/query token"},
+        "constraints": "source < target and target is a response token",
+        "model_input": True,
+    },
+    "edge_attr": {
+        "shape": "[E, C]",
+        "dtype": "float32",
+        "value": "attention[layer, head, target, source] if >tau, else 0",
+        "channel": "same layer-major/head-minor order as x",
+        "model_input": True,
+    },
+    "edge_mark": {
+        "shape": "[E, 2]",
+        "dtype": "float32",
+        "encoding": {"RP": [1.0, 0.0], "RR": [0.0, 1.0]},
+        "model_input": True,
+    },
+    "response_label": {
+        "type": "int",
+        "encoding": {"0": "correct", "1": "contains hallucinated token"},
+        "definition": "any(y_token[response_idx:])",
+        "model_input": False,
+    },
+}
 
 
 def _scalar_int(value: object, name: str) -> int:
@@ -152,6 +217,9 @@ def build_original_graph(
         edge_mark = torch.zeros((0, 2), device=device, dtype=torch.float32)
 
     node_attr = diagonal.permute(2, 0, 1).reshape(token_count, channels)
+    node_role = (
+        torch.arange(token_count, device=device) >= response_idx
+    ).to(dtype=torch.int8)
     source_id = _identity(sample, "source_id")
     response_id = _identity(sample, "response_id")
     split = str(sample.get("split", sample.get("dataset_split", ""))).strip().casefold()
@@ -167,6 +235,7 @@ def build_original_graph(
         "split": split,
         "response_idx": response_idx,
         "token_ids": token_ids,
+        "node_role": node_role,
         "x": node_attr,
         "edge_index": edge_index,
         "edge_attr": edge_attr,
@@ -175,6 +244,28 @@ def build_original_graph(
         "response_label": int(labels[response_idx:].any().item()),
         "tau": threshold,
         "attention_floor": attention_floor,
+        "metadata": {
+            "schema": GRAPH_METADATA_SCHEMA,
+            "num_attention_layers": layers,
+            "num_attention_heads": heads,
+            "num_attention_channels": channels,
+            "channel_order": "layer_major_head_minor",
+            "channel_index_formula": (
+                "channel = layer * num_attention_heads + head"
+            ),
+            "edge_direction": "source_key_to_target_query",
+            "edge_selection": (
+                "edge iff any attention[layer, head, target, source] > tau; "
+                "channels <= tau are stored as zero"
+            ),
+            "relation_encoding": {"RP": [1.0, 0.0], "RR": [0.0, 1.0]},
+            "node_role_encoding": {"prompt": 0, "response": 1},
+            "label_coordinate": "global_prompt_then_response_token_index",
+            "label_encoding": {"non_hallucinated": 0, "hallucinated": 1},
+            "label_source": "RAGTruth y_token from the formal attention cache",
+            "input_policy": str(sample.get("input_policy", "")),
+            "source_cache_dtype": str(sample.get("cache_dtype", "")),
+        },
     }
 
 
@@ -243,7 +334,9 @@ def _graph_matches_source(
             "edge_attr",
             "edge_mark",
             "token_ids",
+            "node_role",
             "y_token",
+            "metadata",
         }
         if not required.issubset(graph):
             return False
@@ -253,6 +346,7 @@ def _graph_matches_source(
             torch.as_tensor(graph["x"]).ndim == 2
             and int(torch.as_tensor(graph["x"]).shape[0]) == node_count
             and torch.as_tensor(graph["y_token"]).numel() == node_count
+            and torch.as_tensor(graph["node_role"]).numel() == node_count
             and tuple(torch.as_tensor(graph["edge_index"]).shape) == (2, edge_count)
             and int(torch.as_tensor(graph["edge_attr"]).shape[0]) == edge_count
             and tuple(torch.as_tensor(graph["edge_mark"]).shape) == (edge_count, 2)
@@ -418,6 +512,7 @@ def prepare_original_graphs(
         "cache_root": str(source_root),
         "tau": float(tau),
         "contains_token_labels": True,
+        "graph_fields": GRAPH_FIELD_SCHEMA,
         "graph_count": len(index),
         "split_counts": split_counts,
         "cache_audit": cache_audit,

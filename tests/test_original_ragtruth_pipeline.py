@@ -198,6 +198,40 @@ class OriginalRagTruthGraphTests(unittest.TestCase):
         self.assertEqual(graph["y_token"].tolist(), [0, 0, 0, 1, 1])
         self.assertEqual(graph["token_ids"].tolist(), [101, 102, 201, 202, 203])
 
+    def test_graph_is_self_describing_without_reopening_the_attention_cache(self):
+        graph = build_original_graph(_formal_sparse_fixture(), tau=0.05)
+
+        self.assertEqual(graph["node_role"].dtype, torch.int8)
+        self.assertEqual(graph["node_role"].tolist(), [0, 0, 1, 1, 1])
+        self.assertEqual(
+            graph["metadata"],
+            {
+                "schema": "original-ragtruth-attributed-graph-metadata-v1",
+                "num_attention_layers": 2,
+                "num_attention_heads": 2,
+                "num_attention_channels": 4,
+                "channel_order": "layer_major_head_minor",
+                "channel_index_formula": (
+                    "channel = layer * num_attention_heads + head"
+                ),
+                "edge_direction": "source_key_to_target_query",
+                "edge_selection": (
+                    "edge iff any attention[layer, head, target, source] > tau; "
+                    "channels <= tau are stored as zero"
+                ),
+                "relation_encoding": {
+                    "RP": [1.0, 0.0],
+                    "RR": [0.0, 1.0],
+                },
+                "node_role_encoding": {"prompt": 0, "response": 1},
+                "label_coordinate": "global_prompt_then_response_token_index",
+                "label_encoding": {"non_hallucinated": 0, "hallucinated": 1},
+                "label_source": "RAGTruth y_token from the formal attention cache",
+                "input_policy": "full_context_no_truncation",
+                "source_cache_dtype": "float32",
+            },
+        )
+
     def test_tau_below_sparse_cache_floor_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "tau.*attention.*floor|floor.*tau"):
             build_original_graph(_formal_sparse_fixture(), tau=0.005)
@@ -244,6 +278,15 @@ class OriginalRagTruthGraphTests(unittest.TestCase):
         self.assertEqual(manifest["schema"], "original-ragtruth-attributed-graphs-v1")
         self.assertEqual(manifest["tau"], 0.05)
         self.assertEqual(manifest["graph_count"], 1)
+        self.assertEqual(manifest["graph_fields"]["x"]["shape"], "[N, C]")
+        self.assertEqual(
+            manifest["graph_fields"]["edge_index"]["rows"],
+            {"0": "source/key token", "1": "target/query token"},
+        )
+        self.assertEqual(
+            manifest["graph_fields"]["y_token"]["encoding"],
+            {"0": "non-hallucinated", "1": "hallucinated"},
+        )
         self.assertEqual(len(index), 1)
         self.assertEqual(index[0]["source_id"], "source-17")
         self.assertEqual(index[0]["response_id"], "response-23")
