@@ -21,6 +21,7 @@ attention_graph/
   ablation.py                        结构、关系和 head 消融
   cli.py                             一键流程编排
 docs/METHOD.md                       完整方法、假设、文献和实验边界
+original/                            上游属性图 + CHARM 监督基线的一键复现
 tests/test_attention_graph_*.py      新方法测试
 ```
 
@@ -30,6 +31,7 @@ tests/test_attention_graph_*.py      新方法测试
 |---|---|---|
 | 当前方法 | `main.py`、`run_ragtruth_attention_graph.sh`、`attention_graph/` | RAGTruth attention 属性图的正式开发入口 |
 | 当前消融 | `run_ragtruth_attention_graph_ablations.sh`、`attention_graph/ablation.py` | 当前方法的核心结构消融 |
+| 上游原方法 | `original/run_ragtruth_original.sh`、`original/` | 保存带 `y_token` 的原格式图并运行监督 CHARM |
 | 旧 token-graph 实验 | `unsupervised_token_graph/`、`run_ragtruth_typed_token_graph.sh`、`run_unsupervised_token_graph_pilot.sh` | 先前 RAGTruth token-graph pilot 的复现 |
 | 旧 HaluEval/属性图实验 | `run_halueval_qa_graph_mae.sh`、`run_halueval_boolq_feature_pilots.sh`、`GNN_train.py`、`processed_graphs_attribute.py` | 先前 HaluEval 和属性图基线的复现 |
 
