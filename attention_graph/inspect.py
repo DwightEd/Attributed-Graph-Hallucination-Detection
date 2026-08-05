@@ -108,6 +108,54 @@ def _read_graph_index(
     return root, index_path, records
 
 
+_LABELED_DATASET_FIELDS = {
+    "response_id",
+    "pair_id",
+    "split",
+    "label",
+    "graph_path",
+}
+
+
+def _read_labeled_dataset_index(
+    artifact_index_path: Path,
+) -> tuple[Path | None, dict[str, dict[str, object]]]:
+    """Read the public dataset index without using it for graph validation."""
+
+    candidate = artifact_index_path.parent / "index.json"
+    if not candidate.is_file():
+        return None, {}
+    try:
+        loaded = json.loads(candidate.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid labeled graph dataset index: {candidate}") from error
+    if not isinstance(loaded, list) or not loaded:
+        raise ValueError("labeled graph dataset index must be a non-empty JSON list")
+    # A legacy run may still use index.json for the technical inventory. It is
+    # not a labeled dataset index and must never be presented as one.
+    if all(isinstance(row, Mapping) and "dataset_split" in row for row in loaded):
+        return None, {}
+    records: dict[str, dict[str, object]] = {}
+    for offset, raw in enumerate(loaded):
+        if not isinstance(raw, Mapping) or set(raw) != _LABELED_DATASET_FIELDS:
+            raise ValueError(
+                f"labeled graph dataset index row {offset} must contain exactly "
+                + ", ".join(sorted(_LABELED_DATASET_FIELDS))
+            )
+        row = {str(key): value for key, value in raw.items()}
+        response_id = str(row["response_id"]).strip()
+        if not response_id or response_id in records:
+            raise ValueError(
+                "labeled graph dataset index requires unique response_id values"
+            )
+        if row["split"] not in {"train", "validation", "test"}:
+            raise ValueError(f"invalid labeled graph split for: {response_id}")
+        if isinstance(row["label"], bool) or row["label"] not in (0, 1):
+            raise ValueError(f"invalid binary graph label for: {response_id}")
+        records[response_id] = row
+    return candidate.resolve(), records
+
+
 def _is_within(path: Path, directory: Path) -> bool:
     try:
         path.relative_to(directory)
@@ -543,6 +591,7 @@ def inspect_run(
     """Inspect an entire prepared run and one selected reusable graph."""
 
     root, index_path, records = _read_graph_index(run_dir)
+    dataset_index_path, dataset_records = _read_labeled_dataset_index(index_path)
     selected_record = _select_record(records, response_id)
     selected_path = _resolve_indexed_path(index_path, selected_record)
     graph = load_graph(selected_path, device="cpu", mmap=True, validate=True)
@@ -552,18 +601,30 @@ def inspect_run(
             "prepared graph identity conflicts with its index: "
             f"index={expected_response_id} graph={graph.response_id}"
         )
+    if dataset_records and set(dataset_records) != {
+        str(record["response_id"]) for record in records
+    }:
+        raise ValueError("artifact and labeled dataset indexes disagree on response ids")
+    selected_dataset_record = dataset_records.get(graph.response_id)
+    split_source: Sequence[Mapping[str, object]] = (
+        list(dataset_records.values()) if dataset_records else records
+    )
     split_counts = dict(
         sorted(
             Counter(
                 str(record.get("split", record.get("dataset_split", "unknown")))
-                for record in records
+                for record in split_source
             ).items()
         )
     )
     return {
         "schema": RUN_INSPECTION_SCHEMA,
         "run_dir": str(root),
-        "graph_index": str(index_path),
+        "graph_index": str(dataset_index_path or index_path),
+        "artifact_index": str(index_path),
+        "dataset_index": (
+            str(dataset_index_path) if dataset_index_path is not None else None
+        ),
         "reusable": {
             "selected_graph_label_free": True,
             "selected_graph_schema_validated": True,
@@ -586,6 +647,7 @@ def inspect_run(
             "policy": "response_id"
             if response_id is not None
             else "first_index_record",
+            "dataset_record": selected_dataset_record,
         },
         "selected_graph": summarize_graph(
             graph, top_edges=top_edges, max_targets=max_targets

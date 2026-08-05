@@ -182,6 +182,11 @@ class GroundingFlowGraphIndexTests(unittest.TestCase):
 
         self.assertEqual(result["samples"], 3)
         self.assertEqual(
+            set(result["first_record"]),
+            {"response_id", "pair_id", "split", "label", "graph_path"},
+        )
+        self.assertIn(result["first_record"]["label"], (0, 1))
+        self.assertEqual(
             result["split_counts"], {"train": 1, "validation": 1, "test": 1}
         )
         self.assertEqual(artifacts, technical_rows)

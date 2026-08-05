@@ -31,5 +31,6 @@ fi
 export PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 "${PYTHON_BIN}" -m grounding_flow.graph_index "${arguments[@]}"
 
-echo "Labeled graph index: ${RUN_DIR}/prepared/graphs/index.json"
-echo "Internal artifact inventory: ${RUN_DIR}/prepared/graphs/artifact_index.json"
+echo "PUBLIC LABELED DATASET INDEX: ${RUN_DIR}/prepared/graphs/index.json"
+echo "The command output above includes first_record; it must contain split and label."
+echo "INTERNAL TECHNICAL INVENTORY: ${RUN_DIR}/prepared/graphs/artifact_index.json"

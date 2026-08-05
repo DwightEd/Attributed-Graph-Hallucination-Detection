@@ -189,7 +189,10 @@ bash ./grounding_flow/inspect_graph.sh
 
 报告默认写在实验目录旁边的 `<RUN_DIR>.graph_structure.json`，避免给不可变运行目录
 增加文件而影响 `--resume`。报告包括全体图规模分布、tensor shape/dtype、RP/RR
-密度、逐 response target 的入边质量、top edges 及其最强 layer/head。稀疏 cache
+密度、逐 response target 的入边质量、top edges 及其最强 layer/head；如果五字段
+数据索引已经生成，`selection.dataset_record` 会同时显示该 response 的真实 split 和
+0/1 label。内部构图统计仍从 `artifact_index.json` 读取，但报告中的 `graph_index`
+明确指向用户使用的带标签 `index.json`。稀疏 cache
 中低于 `attention_floor` 的值未知，因此报告把 edge score 明确标为 retained-attention
 lower bound，而不把它误写成完整 attention 均值。运行目录模式会拒绝索引到目录外的
 图；也可显式检查任意单张图：

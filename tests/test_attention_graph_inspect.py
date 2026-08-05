@@ -210,7 +210,9 @@ class AttentionGraphInspectTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "duplicate response_id"):
                 resolve_graph(run_dir, response_id="duplicate")
 
-    def test_inspector_prefers_artifact_index_over_minimal_labeled_index(self) -> None:
+    def test_inspector_uses_artifact_for_stats_but_reports_labeled_dataset_index(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary) / "run"
             graph_dir = run_dir / "prepared" / "graphs"
@@ -235,7 +237,8 @@ class AttentionGraphInspectTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            (graph_dir / "index.json").write_text(
+            dataset_index = graph_dir / "index.json"
+            dataset_index.write_text(
                 json.dumps(
                     [
                         {
@@ -252,8 +255,20 @@ class AttentionGraphInspectTests(unittest.TestCase):
 
             report = inspect_run(run_dir)
 
-        self.assertEqual(report["graph_index"], str(artifact_index.resolve()))
-        self.assertEqual(report["inventory"]["split_counts"], {"train": 1})
+        self.assertEqual(report["graph_index"], str(dataset_index.resolve()))
+        self.assertEqual(report["artifact_index"], str(artifact_index.resolve()))
+        self.assertEqual(report["dataset_index"], str(dataset_index.resolve()))
+        self.assertEqual(report["inventory"]["split_counts"], {"validation": 1})
+        self.assertEqual(
+            report["selection"]["dataset_record"],
+            {
+                "response_id": "response-a",
+                "pair_id": "source-a",
+                "split": "validation",
+                "label": 1,
+                "graph_path": str(graph_path),
+            },
+        )
 
     def test_resolve_graph_rejects_index_path_outside_prepared_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

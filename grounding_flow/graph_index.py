@@ -337,12 +337,17 @@ def export_completed_run_graph_index(
     artifact_index = separate_artifact_index(graph_dir)
     destination = graph_dir / "index.json"
     atomic_json(destination, index)
+    written = _read_json(destination)
+    if written != index:
+        raise RuntimeError(f"labeled graph index verification failed: {destination}")
     return {
         "index": str(destination),
         "artifact_index": str(artifact_index),
         "samples": len(index),
         "split_counts": dict(Counter(str(row["split"]) for row in index)),
         "label_source": label_source,
+        "fields": sorted(LABELED_GRAPH_INDEX_FIELDS),
+        "first_record": index[0],
     }
 
 
