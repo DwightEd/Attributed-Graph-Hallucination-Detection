@@ -1,4 +1,10 @@
-"""Strict, label-blind adapters for persisted attention caches."""
+"""Strict, label-blind adapters for persisted attention caches.
+
+The formal RAGTruth attention cache may contain ``y_token`` for downstream
+supervised baselines. PATF never copies or reads that field: recognized cache
+schemas are loaded through an explicit attention/identity whitelist. This keeps
+training label blind without requiring a multi-terabyte cache rewrite.
+"""
 
 from __future__ import annotations
 
@@ -30,7 +36,12 @@ def _scalar_int(value: object, name: str) -> int:
 
 
 def assert_label_blind(sample: Mapping[str, object]) -> None:
-    """Reject supervision fields without rejecting benign target-token metadata."""
+    """Reject supervision fields in already-derived feature records.
+
+    Raw dense/formal attention caches are handled by :func:`store_from_sample`
+    through a whitelist and may physically contain labels. This helper remains
+    useful for records that are expected to be intrinsically label free.
+    """
 
     forbidden = []
     for key in sample:
@@ -129,7 +140,8 @@ class SparseCSRAttentionStore(AttentionStore):
         if self.columns.numel() != self.values.numel():
             raise ValueError("sparse columns and values must align")
         if self.columns.numel() and (
-            bool((self.columns < 0).any()) or bool((self.columns >= self.token_count).any())
+            bool((self.columns < 0).any())
+            or bool((self.columns >= self.token_count).any())
         ):
             raise ValueError("sparse source indices are out of range")
         if not bool(torch.isfinite(self.values).all()) or bool((self.values < 0).any()):
@@ -164,58 +176,79 @@ def _metadata(sample: Mapping[str, object]) -> tuple[str, str, int | None]:
     return sample_id, source_id, original_idx
 
 
+def _dense_store(sample: Mapping[str, object]) -> DenseAttentionStore:
+    sample_id, source_id, original_idx = _metadata(sample)
+    if "response_idx" not in sample:
+        raise ValueError("dense attention cache is missing response_idx")
+    return DenseAttentionStore(
+        attention=torch.as_tensor(sample["attention"]),
+        response_idx=_scalar_int(sample["response_idx"], "response_idx"),
+        sample_id=sample_id,
+        source_id=source_id,
+        original_idx=original_idx,
+    )
+
+
+def _formal_sparse_store(sample: Mapping[str, object]) -> SparseCSRAttentionStore:
+    """Build a store from a label-containing raw cache via a safe whitelist."""
+
+    required = {
+        "attention_diagonal",
+        "response_row_ptr",
+        "response_column_indices",
+        "response_values",
+        "response_idx",
+    }
+    missing = sorted(required.difference(sample))
+    if missing:
+        raise ValueError(f"formal sparse cache is missing fields: {missing}")
+    diagonal = torch.as_tensor(sample["attention_diagonal"])
+    if diagonal.ndim != 3:
+        raise ValueError("formal attention_diagonal must have shape [L,H,N]")
+    layers = _scalar_int(
+        sample.get("num_attention_layers", diagonal.shape[0]),
+        "num_attention_layers",
+    )
+    heads = _scalar_int(
+        sample.get("num_attention_heads", diagonal.shape[1]),
+        "num_attention_heads",
+    )
+    if tuple(diagonal.shape[:2]) != (layers, heads):
+        raise ValueError("formal layer/head metadata disagrees with attention_diagonal")
+    sample_id, source_id, original_idx = _metadata(sample)
+    return SparseCSRAttentionStore(
+        row_ptr=torch.as_tensor(sample["response_row_ptr"]),
+        columns=torch.as_tensor(sample["response_column_indices"]),
+        values=torch.as_tensor(sample["response_values"]),
+        layers=layers,
+        heads=heads,
+        token_count=int(diagonal.shape[-1]),
+        response_idx=_scalar_int(sample["response_idx"], "response_idx"),
+        sample_id=sample_id,
+        source_id=source_id,
+        original_idx=original_idx,
+    )
+
+
 def store_from_sample(
     sample: Mapping[str, object], *, require_label_blind: bool = True
 ) -> AttentionStore:
-    """Build the smallest store adapter for a persisted sample mapping."""
+    """Build the smallest store adapter for a persisted sample mapping.
 
+    ``require_label_blind`` means labels must not enter the returned store. For
+    recognized raw attention caches this is guaranteed by explicit field
+    whitelisting, so a physically present ``y_token`` is safely ignored.
+    """
+
+    schema = str(sample.get("attention_cache_schema", ""))
+    if schema == FORMAL_SPARSE_CSR_SCHEMA:
+        return _formal_sparse_store(sample)
+    if "attention" in sample:
+        if require_label_blind:
+            assert_label_blind(sample)
+        return _dense_store(sample)
     if require_label_blind:
         assert_label_blind(sample)
-    sample_id, source_id, original_idx = _metadata(sample)
-    if "attention" in sample:
-        return DenseAttentionStore(
-            attention=torch.as_tensor(sample["attention"]),
-            response_idx=_scalar_int(sample["response_idx"], "response_idx"),
-            sample_id=sample_id,
-            source_id=source_id,
-            original_idx=original_idx,
-        )
-    if str(sample.get("attention_cache_schema", "")) == FORMAL_SPARSE_CSR_SCHEMA:
-        required = {
-            "attention_diagonal",
-            "response_row_ptr",
-            "response_column_indices",
-            "response_values",
-            "response_idx",
-        }
-        missing = sorted(required.difference(sample))
-        if missing:
-            raise ValueError(f"formal sparse cache is missing fields: {missing}")
-        diagonal = torch.as_tensor(sample["attention_diagonal"])
-        if diagonal.ndim != 3:
-            raise ValueError("formal attention_diagonal must have shape [L,H,N]")
-        layers = _scalar_int(
-            sample.get("num_attention_layers", diagonal.shape[0]),
-            "num_attention_layers",
-        )
-        heads = _scalar_int(
-            sample.get("num_attention_heads", diagonal.shape[1]),
-            "num_attention_heads",
-        )
-        if tuple(diagonal.shape[:2]) != (layers, heads):
-            raise ValueError("formal layer/head metadata disagrees with attention_diagonal")
-        return SparseCSRAttentionStore(
-            row_ptr=torch.as_tensor(sample["response_row_ptr"]),
-            columns=torch.as_tensor(sample["response_column_indices"]),
-            values=torch.as_tensor(sample["response_values"]),
-            layers=layers,
-            heads=heads,
-            token_count=int(diagonal.shape[-1]),
-            response_idx=_scalar_int(sample["response_idx"], "response_idx"),
-            sample_id=sample_id,
-            source_id=source_id,
-            original_idx=original_idx,
-        )
     raise ValueError("sample contains neither dense attention nor the formal sparse CSR cache")
 
 
