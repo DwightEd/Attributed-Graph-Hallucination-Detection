@@ -58,6 +58,28 @@ class TopologyFlowContractTests(unittest.TestCase):
             )
         )
 
+    def test_formal_sparse_labels_are_ignored_by_whitelist(self):
+        sample = {
+            "attention_cache_schema": FORMAL_SPARSE_CSR_SCHEMA,
+            "source_id": "source-1",
+            "response_id": "response-1",
+            "response_idx": 2,
+            "num_attention_layers": 1,
+            "num_attention_heads": 1,
+            "attention_diagonal": torch.zeros((1, 1, 4)),
+            "response_row_ptr": torch.tensor([0, 2, 5], dtype=torch.int64),
+            "response_column_indices": torch.tensor(
+                [0, 1, 0, 1, 2], dtype=torch.int32
+            ),
+            "response_values": torch.tensor([0.6, 0.4, 0.2, 0.2, 0.6]),
+            "y_token": torch.tensor([0, 0, 1, 0]),
+            "hallucination_labels": [1],
+        }
+        store = store_from_sample(sample)
+        self.assertEqual(store.sample_id, "response-1")
+        self.assertEqual(store.source_id, "source-1")
+        self.assertEqual(tuple(store.response_rows(0, 0).shape), (2, 4))
+
     def test_label_fields_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "label blind"):
             store_from_sample(
