@@ -1,6 +1,4 @@
-"""Repository entry point."""
-
-from attention_graph.cli import main
+from patf.cli import main
 
 
 if __name__ == "__main__":

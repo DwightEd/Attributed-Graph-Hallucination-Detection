@@ -1,0 +1,27 @@
+{
+  "device": "cuda",
+  "resume": true,
+  "topology": {
+    "mass_cover": 0.8,
+    "relay_discount": 0.85,
+    "head_reducer": "median"
+  },
+  "corruption": {
+    "modes": ["incidence", "collapse", "composite"],
+    "prompt_transfer": 0.45,
+    "local_window": 4,
+    "support_keep_fraction": 0.55,
+    "concentration_power": 1.8
+  },
+  "training": {
+    "hidden_dim": 48,
+    "epochs": 80,
+    "batch_size": 32,
+    "learning_rate": 0.001,
+    "margin": 0.5,
+    "origin_regularization": 0.02,
+    "validation_fraction": 0.2,
+    "patience": 12,
+    "seed": 42
+  }
+}
