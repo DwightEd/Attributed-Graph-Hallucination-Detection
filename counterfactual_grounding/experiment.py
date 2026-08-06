@@ -22,6 +22,10 @@ from .artifacts import (
 )
 from .data.dataset import load_ragtruth_examples, select_balanced_pilot
 from .data.ragtruth import build_ragtruth_layout
+from .observer_runtime import (
+    observer_runtime_identity,
+    parse_observer_runtime_identity,
+)
 from .run_control import ExclusiveRunLock
 from .teacher.counterfactuals import (
     CounterfactualGenerationError,
@@ -35,8 +39,11 @@ from .teacher.pilot import (
     TokenMediationEffect,
     run_gate1_pilot,
 )
+from .transport.data import make_transport_teacher_record
 
 MAX_PILOT_SEQUENCE_TOKENS = 2048
+ELIGIBLE_FRAME_SCHEMA = "cept-eligible-response-frame-v1"
+ELIGIBLE_FRAME_ORIGIN = "verified_train_attention_cache_filename_inventory"
 
 
 @dataclass(frozen=True)
@@ -45,6 +52,7 @@ class PilotConfig:
     sources: Path
     model: Path
     output_dir: Path
+    eligible_response_ids: Path
     split: str = "train"
     num_samples: int = 50
     seed: int = 42
@@ -52,8 +60,8 @@ class PilotConfig:
     dtype: str = "float16"
     max_sequence_tokens: int = 2048
     max_counterfactuals: int = 2
-    history_block_size: int = 0
-    max_history_blocks: int = 0
+    history_block_size: int = 4
+    max_history_blocks: int = 8
     resume: bool = False
 
     def validate(self) -> None:
@@ -80,9 +88,113 @@ class PilotConfig:
             (self.responses, "RAGTruth response.jsonl"),
             (self.sources, "RAGTruth source_info.jsonl"),
             (self.model, "observer model"),
+            (self.eligible_response_ids, "verified cache eligible-response frame"),
         ):
             if not path.expanduser().exists():
                 raise FileNotFoundError(f"{description} is absent: {path}")
+
+
+def _load_eligible_response_frame(
+    path: Path,
+    *,
+    split: str,
+    dataset_files_sha256: Mapping[str, str],
+) -> tuple[list[str], dict[str, object]]:
+    """Read the immutable, label-free sampling frame emitted from cache membership."""
+
+    source = path.expanduser().resolve()
+    rows: list[Mapping[str, object]] = []
+    with source.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"invalid eligible-response JSON at {source}:{line_number}"
+                ) from error
+            if not isinstance(row, Mapping):
+                raise TypeError(
+                    f"eligible-response row must be an object: {source}:{line_number}"
+                )
+            if row.get("schema") != ELIGIBLE_FRAME_SCHEMA:
+                raise ValueError(
+                    f"eligible-response frame schema mismatch: {source}:{line_number}"
+                )
+            rows.append(row)
+    if not rows or rows[0].get("record_type") != "metadata":
+        raise ValueError("eligible-response frame must begin with one metadata row")
+    if any(row.get("record_type") == "metadata" for row in rows[1:]):
+        raise ValueError("eligible-response frame must contain exactly one metadata row")
+
+    metadata = dict(rows[0])
+    requested_split = split.casefold()
+    if str(metadata.get("official_split", "")).casefold() != requested_split:
+        raise ValueError("eligible-response frame official split mismatch")
+    if metadata.get("origin") != ELIGIBLE_FRAME_ORIGIN:
+        raise ValueError("eligible-response frame was not derived from verified cache")
+    declared_dataset = metadata.get("dataset_files_sha256")
+    if not isinstance(declared_dataset, Mapping) or {
+        str(name): str(digest) for name, digest in declared_dataset.items()
+    } != dict(dataset_files_sha256):
+        raise RuntimeError(
+            "eligible-response frame dataset hashes disagree with current RAGTruth files"
+        )
+    for selector in ("generator_model_selector", "task_type_selector"):
+        value = metadata.get(selector)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"eligible-response frame requires non-empty {selector}")
+    manifest_digest = metadata.get("cache_manifest_sha256")
+    if (
+        not isinstance(manifest_digest, str)
+        or len(manifest_digest) != 64
+        or any(character not in "0123456789abcdefABCDEF" for character in manifest_digest)
+    ):
+        raise ValueError("eligible-response frame cache manifest hash is malformed")
+    manifest_path = metadata.get("cache_manifest_path")
+    if not isinstance(manifest_path, str) or not manifest_path.strip():
+        raise ValueError("eligible-response frame requires cache_manifest_path")
+
+    response_ids: list[str] = []
+    cache_files: list[str] = []
+    for line_number, row in enumerate(rows[1:], start=2):
+        if row.get("record_type") != "response":
+            raise ValueError(
+                f"eligible-response frame has invalid record type at line {line_number}"
+            )
+        if str(row.get("official_split", "")).casefold() != requested_split:
+            raise ValueError(
+                f"eligible-response row has wrong split at line {line_number}"
+            )
+        response_id = str(row.get("response_id", "")).strip()
+        cache_file = str(row.get("cache_file", "")).strip()
+        if not response_id or not cache_file:
+            raise ValueError(
+                f"eligible-response row requires response_id/cache_file at line {line_number}"
+            )
+        if Path(cache_file).name != cache_file or not (
+            cache_file.startswith("attention_") and cache_file.endswith(".pt")
+        ):
+            raise ValueError(
+                f"eligible-response row has invalid cache_file at line {line_number}"
+            )
+        response_ids.append(response_id)
+        cache_files.append(cache_file)
+    if not response_ids:
+        raise ValueError("eligible-response frame contains no response IDs")
+    if len(response_ids) != len(set(response_ids)):
+        raise ValueError("eligible-response frame contains duplicate response IDs")
+    if len(cache_files) != len(set(cache_files)):
+        raise ValueError("eligible-response frame contains cache filename collisions")
+    declared_count = metadata.get("eligible_response_count")
+    if (
+        isinstance(declared_count, bool)
+        or not isinstance(declared_count, int)
+        or declared_count != len(response_ids)
+    ):
+        raise ValueError("eligible-response frame count does not match its response rows")
+    return response_ids, metadata
 
 
 def _dtype(name: str) -> torch.dtype | str:
@@ -101,10 +213,18 @@ def _history_blocks(
         return {}
     history = list(range(response_idx, token_count - 1))
     blocks = [history[start : start + size] for start in range(0, len(history), size)]
-    # Recent response tokens can mediate the largest number of currently
-    # untested local continuations; retain the last registered blocks if a cap
-    # is requested.  This is a pilot policy, not an attention-based selector.
-    blocks = blocks[-maximum:]
+    # Cover the full response trajectory instead of selecting high-attention
+    # or recent-only blocks.  This keeps onset and continuation testable while
+    # fixing the number of expensive intervention calls before labels exist.
+    if len(blocks) > maximum:
+        if maximum == 1:
+            blocks = [blocks[len(blocks) // 2]]
+        else:
+            indices = [
+                round(index * (len(blocks) - 1) / (maximum - 1))
+                for index in range(maximum)
+            ]
+            blocks = [blocks[index] for index in indices]
     return {
         f"history-block-{values[0]}-{values[-1]}": torch.tensor(
             values, dtype=torch.long
@@ -289,6 +409,11 @@ def _effect_rows(records: Sequence[Gate1Record]) -> list[dict[str, object]]:
                     "alternate_history_kv_effect": effect.alternate,
                     "interaction": effect.interaction,
                     "decomposition_residual": effect.contract_residual,
+                    "direct_seed_rescue": effect.direct_seed_rescue,
+                    "joint_seed_history_rescue": effect.joint_seed_history_rescue,
+                    "representation_residual": effect.representation_residual,
+                    "seed_history_interaction": effect.seed_history_interaction,
+                    "self_patch_error": effect.self_patch_error,
                     "block_rescue": effect.block_rescue,
                 }
             )
@@ -445,11 +570,47 @@ def _run_pilot_locked(
     import transformers
 
     print(json.dumps({"event": "provenance_hashing_started"}), flush=True)
+    dataset_file_hashes = {
+        "response.jsonl": file_sha256(config.responses),
+        "source_info.jsonl": file_sha256(config.sources),
+    }
     dataset_identity = {
         "responses": str(config.responses.expanduser().resolve()),
-        "responses_sha256": file_sha256(config.responses),
+        "responses_sha256": dataset_file_hashes["response.jsonl"],
         "sources": str(config.sources.expanduser().resolve()),
-        "sources_sha256": file_sha256(config.sources),
+        "sources_sha256": dataset_file_hashes["source_info.jsonl"],
+    }
+    eligible_ids, eligible_metadata = _load_eligible_response_frame(
+        config.eligible_response_ids,
+        split=config.split,
+        dataset_files_sha256=dataset_file_hashes,
+    )
+    if config.num_samples > len(eligible_ids):
+        raise ValueError(
+            f"requested num_samples={config.num_samples} exceeds eligible cache "
+            f"frame size={len(eligible_ids)}"
+        )
+    examples = load_ragtruth_examples(
+        config.responses,
+        config.sources,
+        split=config.split,
+        response_ids=eligible_ids,
+    )
+    generator_counts = Counter(
+        example.generator_model or "unknown" for example in examples
+    )
+    estimand_scope = {
+        "dataset": "RAGTruth",
+        "official_split": config.split.casefold(),
+        "eligible_population": "verified_train_attention_cache_inventory",
+        "cache_manifest_path": str(eligible_metadata["cache_manifest_path"]),
+        "cache_manifest_sha256": str(eligible_metadata["cache_manifest_sha256"]),
+        "generator_model_selector": str(
+            eligible_metadata["generator_model_selector"]
+        ),
+        "task_type_selector": str(eligible_metadata["task_type_selector"]),
+        "generator_models": dict(sorted(generator_counts.items())),
+        "selection_policy": "task_generator_round_robin_source_unique_sha256_v1",
     }
     model_source_signature = source_inventory_signature(config.model)
     contract_config = asdict(config)
@@ -458,7 +619,24 @@ def _run_pilot_locked(
     run_contract = {
         "config": contract_config,
         "dataset": dataset_identity,
+        "sampling_frame": {
+            "path": str(config.eligible_response_ids.expanduser().resolve()),
+            "sha256": file_sha256(config.eligible_response_ids),
+            "count": len(eligible_ids),
+        },
+        "estimand_scope": estimand_scope,
         "model_source_signature": f"sha256:{model_source_signature}",
+        "implementation_sha256": {
+            relative: file_sha256(Path(__file__).resolve().parent / relative)
+            for relative in (
+                "experiment.py",
+                "teacher/counterfactuals.py",
+                "teacher/mediation.py",
+                "teacher/pilot.py",
+                "observer_runtime.py",
+                "transport/data.py",
+            )
+        },
         "environment": {
             "transformers_version": transformers.__version__,
             "torch_version": torch.__version__,
@@ -489,7 +667,9 @@ def _run_pilot_locked(
     }
     if manifest_path.exists():
         if not config.resume:
-            raise FileExistsError(f"refusing to overwrite an existing CEPT run: {output}")
+            raise FileExistsError(
+                f"refusing to overwrite an existing CEPT run: {output}"
+            )
         existing = json.loads(manifest_path.read_text(encoding="utf-8"))
         if existing.get("run_state") == "complete":
             raise FileExistsError(f"CEPT run is already complete: {output}")
@@ -521,9 +701,6 @@ def _run_pilot_locked(
     atomic_json(manifest_path, initial_manifest)
 
     tokenizer = _tokenizer_only(config)
-    examples = load_ragtruth_examples(
-        config.responses, config.sources, split=config.split
-    )
     selected = select_balanced_pilot(
         examples, limit=config.num_samples, seed=config.seed
     )
@@ -532,10 +709,16 @@ def _run_pilot_locked(
             f"source-unique balanced selection returned {len(selected)} of "
             f"{config.num_samples} requested samples"
         )
+    eligible_set = set(eligible_ids)
+    if any(example.response_id not in eligible_set for example in selected):
+        raise RuntimeError(
+            "balanced selection escaped the verified cache eligible-response frame"
+        )
 
     selection_rows: list[dict[str, object]] = []
     counterfactual_rows: list[dict[str, object]] = []
     pairs: list[Gate1Pair] = []
+    changed_positions_by_id: dict[str, tuple[int, ...]] = {}
     for rank, example in enumerate(selected):
         row: dict[str, object] = {
             "selection_rank": rank,
@@ -591,6 +774,9 @@ def _run_pilot_locked(
                 ),
             )
             pairs.append(pair)
+            changed_positions_by_id[example.response_id] = tuple(
+                int(value) for value in primary.changed_positions.tolist()
+            )
             row["state"] = "counterfactual_available"
             row["counterfactual_candidates"] = len(candidates)
             row["pair_signature_sha256"] = _pair_signature(pair)
@@ -652,6 +838,12 @@ def _run_pilot_locked(
     backend: LlamaKVMediationBackend | None
     if all_shards_available and isinstance(raw_resume_runtime, Mapping):
         runtime = _runtime_from_mapping(raw_resume_runtime)
+        observer_runtime, observer_runtime_signature = (
+            parse_observer_runtime_identity(
+                initial_manifest.get("observer_runtime"),
+                initial_manifest.get("observer_runtime_signature"),
+            )
+        )
         gpu_report = {
             "event": "gpu_preflight",
             "skipped": True,
@@ -671,13 +863,29 @@ def _run_pilot_locked(
             model=model,
             source_signature=model_source_signature,
         )
+        resolved_dtype = (
+            config.dtype
+            if config.dtype != "auto"
+            else str(next(model.parameters()).dtype)
+        )
+        observer_runtime, observer_runtime_signature = observer_runtime_identity(
+            transformers_version=runtime.transformers_version,
+            torch_version=runtime.torch_version,
+            dtype=resolved_dtype,
+            attn_implementation="eager",
+        )
         backend = LlamaKVMediationBackend(model)
         expected_forwards = sum(
-            6 + len(pair.rescue_blocks)
+            8 + len(pair.rescue_blocks)
             for pair, path in zip(pairs, shard_paths, strict=True)
             if not path.is_file()
         )
-        initial_manifest = {**initial_manifest, "runtime": asdict(runtime)}
+        initial_manifest = {
+            **initial_manifest,
+            "runtime": asdict(runtime),
+            "observer_runtime": observer_runtime,
+            "observer_runtime_signature": observer_runtime_signature,
+        }
         atomic_json(manifest_path, initial_manifest)
     print(
         json.dumps(
@@ -692,9 +900,7 @@ def _run_pilot_locked(
 
     records: list[Gate1Record] = []
     self_patch_values: list[float] = []
-    for index, (pair, shard_path) in enumerate(
-        zip(pairs, shard_paths, strict=True)
-    ):
+    for index, (pair, shard_path) in enumerate(zip(pairs, shard_paths, strict=True)):
         pair_hash = _pair_signature(pair)
         if shard_path.exists():
             if not config.resume:
@@ -748,9 +954,7 @@ def _run_pilot_locked(
                         "total": len(pairs),
                         "response_id": sample_id,
                         "condition": condition,
-                        "sample_elapsed_seconds": round(
-                            time.monotonic() - _started, 3
-                        ),
+                        "sample_elapsed_seconds": round(time.monotonic() - _started, 3),
                     }
                 ),
                 flush=True,
@@ -806,10 +1010,28 @@ def _run_pilot_locked(
 
     effects = _effect_rows(records)
     atomic_jsonl(output / "effects.jsonl", effects)
+    pair_by_id = {pair.sample_id: pair for pair in pairs}
+    transport_teachers = [
+        make_transport_teacher_record(
+            record,
+            pair_by_id[record.sample_id],
+            changed_evidence_positions=changed_positions_by_id[record.sample_id],
+            official_split="train",
+            model_signature=runtime.model_signature,
+            model_source_signature=f"sha256:{model_source_signature}",
+            tokenizer_signature=runtime.tokenizer_signature,
+            observer_runtime=observer_runtime,
+            observer_runtime_signature=observer_runtime_signature,
+        )
+        for record in records
+    ]
+    atomic_jsonl(output / "transport_teacher.jsonl", transport_teachers)
     residual_max = max(
         (abs(float(row["decomposition_residual"])) for row in effects), default=0.0
     )
-    first_effects = [record.token_effects[0] for record in records if record.token_effects]
+    first_effects = [
+        record.token_effects[0] for record in records if record.token_effects
+    ]
     first_history_effect_max = max(
         (max(abs(item.mediated), abs(item.alternate)) for item in first_effects),
         default=0.0,
@@ -840,7 +1062,7 @@ def _run_pilot_locked(
         row for row in selected_rows if row["state"] == "counterfactual_available"
     ]
     coverage = {
-        "official_train_inventory": _stratified_counts(available_rows),
+        "eligible_cache_inventory": _stratified_counts(available_rows),
         "selected": _stratified_counts(selected_rows),
         "counterfactual_available": _stratified_counts(counterfactual_available_rows),
         "mediation_complete": _stratified_counts(mediated_rows),
@@ -889,14 +1111,24 @@ def _run_pilot_locked(
             "mediated": "Y11 - Y10: response-history K/V-mediated effect",
             "alternate": "Y01 - Y00: reverse-direction mediation check",
             "interaction": "mediated - alternate: direction sensitivity check",
+            "direct_seed_rescue": (
+                "Y(E0, patch changed evidence K/V from E1) - Y00: total recursive "
+                "support initiated by the changed-evidence seed"
+            ),
+            "joint_seed_history_rescue": (
+                "Y(E0, patch changed-evidence and response-history K/V from E1) - Y00"
+            ),
         },
         "counterfactual_protocol": "numeric_digit_surface_preserving_v1",
+        "observer_runtime": observer_runtime,
+        "observer_runtime_signature": observer_runtime_signature,
         "self_patch_max_abs": self_patch_max,
     }
     artifact_paths = {
         "selection": output / "selection.jsonl",
         "counterfactual_audit": output / "counterfactual_audit.jsonl",
         "effects": output / "effects.jsonl",
+        "transport_teacher": output / "transport_teacher.jsonl",
         "gate_report": output / "gate_report.json",
     }
     artifact_manifest = {
@@ -936,8 +1168,11 @@ def _run_pilot_locked(
             "counterfactual_available": len(pairs),
             "mediation_complete": len(records),
             "effect_tokens": len(effects),
+            "transport_teacher_samples": len(transport_teachers),
         },
         "runtime": asdict(runtime),
+        "observer_runtime": observer_runtime,
+        "observer_runtime_signature": observer_runtime_signature,
         "gpu_preflight": gpu_report,
         "teacher_manifest": teacher_manifest,
         "artifacts": artifact_manifest,
@@ -946,7 +1181,11 @@ def _run_pilot_locked(
             "The current counterfactual adapter is limited to one-character numeric edits.",
             "Additional candidates are audited but only candidate 0 is mediated in this pilot.",
             "Multi-counterfactual effect stability has not yet been tested.",
-            "The graph student and hallucination scorer remain gated on this pilot.",
+            "The transport student is trained separately and never reads hallucination labels.",
+            (
+                "The estimand is restricted to the generator/task selectors and "
+                "response IDs present in the verified train attention cache."
+            ),
         ],
     }
     atomic_json(manifest_path, final_manifest)

@@ -85,12 +85,14 @@ def file_sha256(path: str | Path) -> str:
 
 
 def source_inventory_signature(path: str | Path) -> str:
-    """Hash every file that defines a local model/tokenizer source.
+    """Hash loader-visible root files that define a model/tokenizer source.
 
     Weight filenames and sizes are not a model identity: two checkpoints can
     have the same inventory while containing different values.  Gate artifacts
     therefore pay the one-time sequential-read cost and bind themselves to the
-    actual checkpoint bytes.
+    actual checkpoint bytes.  Hugging Face loader artifacts live at the source
+    root; nested ``.cache``/download metadata is deliberately excluded so it
+    cannot silently change an otherwise identical model identity.
     """
 
     source = Path(path).expanduser().resolve()
@@ -99,7 +101,7 @@ def source_inventory_signature(path: str | Path) -> str:
     if source.is_file():
         return file_sha256(source)
     inventory: list[dict[str, object]] = []
-    for item in sorted(source.rglob("*")):
+    for item in sorted(source.iterdir()):
         if not item.is_file():
             continue
         relative = item.relative_to(source).as_posix()

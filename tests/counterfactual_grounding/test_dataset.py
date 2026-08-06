@@ -14,9 +14,7 @@ from counterfactual_grounding.data.dataset import (
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
-    path.write_text(
-        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
-    )
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
 
 def test_loader_projects_response_labels_out_of_the_training_contract(tmp_path: Path):
@@ -166,8 +164,10 @@ def test_pilot_selection_balances_tasks_and_never_reuses_a_source():
 
     assert len(selected) == 9
     assert len({item.source_id for item in selected}) == 9
-    assert {task: sum(item.task_type == task for item in selected) for task in
-            ("Summary", "QA", "Data2txt")} == {
+    assert {
+        task: sum(item.task_type == task for item in selected)
+        for task in ("Summary", "QA", "Data2txt")
+    } == {
         "Summary": 3,
         "QA": 3,
         "Data2txt": 3,

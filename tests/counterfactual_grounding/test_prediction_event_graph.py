@@ -142,7 +142,9 @@ class PredictionEventGraphGate0Tests(unittest.TestCase):
             torch.tensor([0.35], dtype=torch.float32),
         )
 
-    def test_floor_censored_attention_is_kept_as_unknown_not_assigned_to_a_relation(self):
+    def test_floor_censored_attention_is_kept_as_unknown_not_assigned_to_a_relation(
+        self,
+    ):
         graph = build_prediction_event_graph(_formal_sparse_fixture())
 
         # Dimension order is [prediction event, channel, EY/QY/RY].

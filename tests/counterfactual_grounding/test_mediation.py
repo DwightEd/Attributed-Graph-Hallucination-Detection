@@ -152,24 +152,36 @@ class LlamaKVMediationBackendGate1Tests(unittest.TestCase):
             normalized = model.model.layers[0].input_layernorm(embeddings)
             attention = model.model.layers[0].self_attn
             head_dim = attention.head_dim
-            query = attention.q_proj(normalized).view(
-                1,
-                input_ids.shape[1],
-                model.config.num_attention_heads,
-                head_dim,
-            ).transpose(1, 2)
-            raw_key = attention.k_proj(normalized).view(
-                1,
-                input_ids.shape[1],
-                model.config.num_key_value_heads,
-                head_dim,
-            ).transpose(1, 2)
-            raw_value = attention.v_proj(normalized).view(
-                1,
-                input_ids.shape[1],
-                model.config.num_key_value_heads,
-                head_dim,
-            ).transpose(1, 2)
+            query = (
+                attention.q_proj(normalized)
+                .view(
+                    1,
+                    input_ids.shape[1],
+                    model.config.num_attention_heads,
+                    head_dim,
+                )
+                .transpose(1, 2)
+            )
+            raw_key = (
+                attention.k_proj(normalized)
+                .view(
+                    1,
+                    input_ids.shape[1],
+                    model.config.num_key_value_heads,
+                    head_dim,
+                )
+                .transpose(1, 2)
+            )
+            raw_value = (
+                attention.v_proj(normalized)
+                .view(
+                    1,
+                    input_ids.shape[1],
+                    model.config.num_key_value_heads,
+                    head_dim,
+                )
+                .transpose(1, 2)
+            )
             cos, sin = model.model.rotary_emb(embeddings, position_ids)
             _, rotated_key = apply_rotary_pos_emb(query, raw_key, cos, sin)
 
@@ -184,9 +196,7 @@ class LlamaKVMediationBackendGate1Tests(unittest.TestCase):
             )
         )
         torch.testing.assert_close(run.kv.keys[0], expected_key, atol=1e-6, rtol=0)
-        torch.testing.assert_close(
-            run.kv.values[0], expected_value, atol=1e-6, rtol=0
-        )
+        torch.testing.assert_close(run.kv.values[0], expected_value, atol=1e-6, rtol=0)
 
     @unittest.skipUnless(
         transformers.__version__ == "4.52.3",
@@ -263,10 +273,7 @@ class LlamaKVMediationBackendGate1Tests(unittest.TestCase):
         )
         self.assertGreater(
             float(
-                (
-                    patched.target_log_probs[:, 2]
-                    - counterfactual.target_log_probs[:, 2]
-                )
+                (patched.target_log_probs[:, 2] - counterfactual.target_log_probs[:, 2])
                 .abs()
                 .max()
             ),

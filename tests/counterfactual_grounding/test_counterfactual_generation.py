@@ -148,7 +148,9 @@ class EqualTokenCounterfactualGenerationGate0Tests(unittest.TestCase):
         self.assertTrue(result.replacement_text.isdigit())
         self.assertNotEqual(result.original_text, result.replacement_text)
         self.assertEqual(
-            result.factual_text[:char_start] + result.replacement_text + result.factual_text[char_end:],
+            result.factual_text[:char_start]
+            + result.replacement_text
+            + result.factual_text[char_end:],
             result.counterfactual_text,
         )
         evidence_chunk = layout.evidence_chunks[0]
@@ -180,7 +182,9 @@ class EqualTokenCounterfactualGenerationGate0Tests(unittest.TestCase):
             result.audit.changed_positions.tolist(),
         )
 
-    def test_skips_a_numeric_edit_that_changes_token_count_and_tries_later_evidence(self):
+    def test_skips_a_numeric_edit_that_changes_token_count_and_tries_later_evidence(
+        self,
+    ):
         tokenizer = FirstNumberLengthChangingTokenizer()
         layout = _summary_layout(
             evidence="Measurements A1 and B2 were recorded.",
@@ -191,7 +195,9 @@ class EqualTokenCounterfactualGenerationGate0Tests(unittest.TestCase):
 
         result = generate_equal_token_counterfactual(layout, tokenizer)
 
-        self.assertEqual(result.changed_char_span, (expected_second_digit, expected_second_digit + 1))
+        self.assertEqual(
+            result.changed_char_span, (expected_second_digit, expected_second_digit + 1)
+        )
         self.assertEqual(result.original_text, "2")
         self.assertEqual(
             _as_long_tensor(result.factual_input_ids).numel(),

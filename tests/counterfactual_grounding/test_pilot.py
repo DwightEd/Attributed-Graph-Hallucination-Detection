@@ -51,7 +51,9 @@ class FakeMediationBackend:
         patch_positions: torch.Tensor | None = None,
     ) -> MediationRun:
         del attention_mask
-        receiver = "factual" if torch.equal(input_ids[0], FACTUAL_IDS) else "counterfactual"
+        receiver = (
+            "factual" if torch.equal(input_ids[0], FACTUAL_IDS) else "counterfactual"
+        )
         targets = target_positions.detach().cpu().clone()
 
         if capture_positions is not None:
@@ -84,12 +86,20 @@ class FakeMediationBackend:
         sender_tag = int(sender.keys[0][0, 0, 0, 0].item())
         sender_name = "factual" if sender_tag == 1 else "counterfactual"
         full_history = torch.equal(patch, torch.tensor([2, 3]))
+        joint_seed_history = torch.equal(patch, torch.tensor([0, 2, 3]))
         if receiver == "factual" and sender_name == "counterfactual" and full_history:
             condition = "Y10"
             scores = torch.tensor([[1.0, 2.0, 4.0]])
         elif receiver == "counterfactual" and sender_name == "factual" and full_history:
             condition = "Y01"
             scores = torch.tensor([[0.5, 1.4, 3.5]])
+        elif (
+            receiver == "counterfactual"
+            and sender_name == "factual"
+            and joint_seed_history
+        ):
+            condition = "joint"
+            scores = torch.tensor([[0.8, 2.0, 4.0]])
         elif receiver == "counterfactual" and sender_name == "factual":
             condition = "block"
             scores = torch.tensor([[0.5, 1.2, 2.8]])
@@ -120,7 +130,9 @@ class SelfPatchFakeMediationBackend(FakeMediationBackend):
             receiver_is_factual = torch.equal(input_ids[0], FACTUAL_IDS)
             sender_is_factual = int(sender.keys[0][0, 0, 0, 0].item()) == 1
             if receiver_is_factual == sender_is_factual:
-                condition = "self-factual" if receiver_is_factual else "self-counterfactual"
+                condition = (
+                    "self-factual" if receiver_is_factual else "self-counterfactual"
+                )
                 scores = (
                     torch.tensor([[1.0, 3.0, 5.0]])
                     if receiver_is_factual
@@ -187,6 +199,8 @@ def test_pilot_runs_four_conditions_cross_patches_history_and_emits_token_effect
         "Y10",
         "Y01",
         "block",
+        "joint",
+        "block",
     ]
     y10 = next(call for call in backend.calls if call["condition"] == "Y10")
     y01 = next(call for call in backend.calls if call["condition"] == "Y01")
@@ -194,7 +208,19 @@ def test_pilot_runs_four_conditions_cross_patches_history_and_emits_token_effect
     assert (y01["receiver"], y01["sender"]) == ("counterfactual", "factual")
     torch.testing.assert_close(y10["patch"], torch.tensor([2, 3]))
     torch.testing.assert_close(y01["patch"], torch.tensor([2, 3]))
-    block = next(call for call in backend.calls if call["condition"] == "block")
+    direct_seed = next(
+        call
+        for call in backend.calls
+        if call["condition"] == "block" and call["patch"].tolist() == [0]
+    )
+    block = next(
+        call
+        for call in backend.calls
+        if call["condition"] == "block" and call["patch"].tolist() == [2]
+    )
+    torch.testing.assert_close(direct_seed["patch"], torch.tensor([0]))
+    joint = next(call for call in backend.calls if call["condition"] == "joint")
+    torch.testing.assert_close(joint["patch"], torch.tensor([0, 2, 3]))
     assert (block["receiver"], block["sender"]) == ("counterfactual", "factual")
     torch.testing.assert_close(block["patch"], torch.tensor([2]))
 
@@ -215,9 +241,21 @@ def test_pilot_runs_four_conditions_cross_patches_history_and_emits_token_effect
     assert [row.contract_residual for row in token_rows] == pytest.approx(
         [0.0, 0.0, 0.0], abs=1e-7
     )
-    assert [row.block_rescue["evidence-chunk-0"] for row in token_rows] == pytest.approx(
+    assert [row.direct_seed_rescue for row in token_rows] == pytest.approx(
         [0.0, 0.2, 0.8]
     )
+    assert [row.joint_seed_history_rescue for row in token_rows] == pytest.approx(
+        [0.3, 1.0, 2.0]
+    )
+    assert [row.representation_residual for row in token_rows] == pytest.approx(
+        [0.2, 1.0, 1.0]
+    )
+    assert [row.seed_history_interaction for row in token_rows] == pytest.approx(
+        [0.3, 0.4, -0.3]
+    )
+    assert [
+        row.block_rescue["evidence-chunk-0"] for row in token_rows
+    ] == pytest.approx([0.0, 0.2, 0.8])
     # The first response event has no response-history token to mediate it.
     assert token_rows[0].mediated == pytest.approx(0.0, abs=1e-7)
 
@@ -239,7 +277,7 @@ def test_pilot_runs_four_conditions_cross_patches_history_and_emits_token_effect
     assert "non-history" in direct_definition
 
 
-def test_rescue_block_is_optional_and_the_default_pilot_has_exactly_four_runs():
+def test_history_rescue_block_is_optional_but_direct_seed_rescue_is_required():
     backend = FakeMediationBackend()
 
     result = run_gate1_pilot(
@@ -253,6 +291,8 @@ def test_rescue_block_is_optional_and_the_default_pilot_has_exactly_four_runs():
         "Y00",
         "Y10",
         "Y01",
+        "block",
+        "joint",
     ]
     assert all(not row.block_rescue for row in result.records[0].token_effects)
 
@@ -291,6 +331,8 @@ def test_optional_real_runtime_self_patch_audit_is_recorded():
         "Y01",
         "self-factual",
         "self-counterfactual",
+        "block",
+        "joint",
     ]
     assert result.manifest.self_patch_max_abs == pytest.approx(0.0)
 
@@ -320,5 +362,7 @@ def test_condition_progress_reports_each_completed_condition_without_changing_sa
         ("valid-1", "Y01"),
         ("valid-1", "self_patch_Y11"),
         ("valid-1", "self_patch_Y00"),
+        ("valid-1", "direct_seed_rescue"),
+        ("valid-1", "joint_seed_history_rescue"),
     ]
     assert completed_samples == [(1, 1, "valid-1")]

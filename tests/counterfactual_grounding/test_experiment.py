@@ -21,7 +21,9 @@ class CharacterTokenizer:
     special_tokens_map: ClassVar[dict[str, str]] = {}
     chat_template = None
 
-    def __call__(self, text: str, *, add_special_tokens: bool, return_offsets_mapping: bool):
+    def __call__(
+        self, text: str, *, add_special_tokens: bool, return_offsets_mapping: bool
+    ):
         assert not add_special_tokens
         result: dict[str, object] = {"input_ids": [ord(value) for value in text]}
         if return_offsets_mapping:
@@ -49,9 +51,16 @@ class FakeBackend:
         value = torch.full((1, 1, positions.numel(), 1), float(tag))
         return KVStore(positions=positions.clone(), keys={0: value}, values={0: value})
 
-    def run(self, *, input_ids: torch.Tensor, attention_mask: torch.Tensor,
-            target_positions: torch.Tensor, capture_positions: torch.Tensor | None = None,
-            sender: KVStore | None = None, patch_positions: torch.Tensor | None = None) -> MediationRun:
+    def run(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        target_positions: torch.Tensor,
+        capture_positions: torch.Tensor | None = None,
+        sender: KVStore | None = None,
+        patch_positions: torch.Tensor | None = None,
+    ) -> MediationRun:
         del attention_mask, patch_positions
         count = target_positions.numel()
         base = torch.arange(count, dtype=torch.float32).unsqueeze(0)
@@ -80,7 +89,50 @@ def _jsonl(path: Path, rows: list[dict[str, object]]) -> None:
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
 
-def test_full_pilot_writes_recomputable_label_free_artifacts(tmp_path: Path, monkeypatch):
+def _eligible_ids(
+    path: Path,
+    responses: Path,
+    sources: Path,
+    *response_ids: str,
+    generator_model_selector: str = "all",
+    task_type_selector: str = "all",
+) -> Path:
+    _jsonl(
+        path,
+        [
+            {
+                "schema": "cept-eligible-response-frame-v1",
+                "record_type": "metadata",
+                "official_split": "train",
+                "origin": "verified_train_attention_cache_filename_inventory",
+                "eligible_response_count": len(response_ids),
+                "dataset_files_sha256": {
+                    "response.jsonl": experiment.file_sha256(responses),
+                    "source_info.jsonl": experiment.file_sha256(sources),
+                },
+                "generator_model_selector": generator_model_selector,
+                "task_type_selector": task_type_selector,
+                "cache_manifest_path": "fixture/train/manifest.json",
+                "cache_manifest_sha256": "0" * 64,
+            }
+        ]
+        + [
+            {
+                "schema": "cept-eligible-response-frame-v1",
+                "record_type": "response",
+                "response_id": response_id,
+                "official_split": "train",
+                "cache_file": f"attention_{response_id}.pt",
+            }
+            for response_id in response_ids
+        ],
+    )
+    return path
+
+
+def test_full_pilot_writes_recomputable_label_free_artifacts(
+    tmp_path: Path, monkeypatch
+):
     responses = tmp_path / "response.jsonl"
     sources = tmp_path / "source_info.jsonl"
     model_path = tmp_path / "model"
@@ -88,35 +140,102 @@ def test_full_pilot_writes_recomputable_label_free_artifacts(tmp_path: Path, mon
     model_path.mkdir()
     (model_path / "config.json").write_text('{"model_type":"llama"}', encoding="utf-8")
     evidence = "The measured value is 8."
-    _jsonl(sources, [{
-        "source_id": "s1", "task_type": "Summary", "source_info": evidence,
-        "prompt": f"Summarize:\n{evidence}\noutput:",
-    }])
-    _jsonl(responses, [{
-        "id": "r1", "source_id": "s1", "response": "The value is eight.",
-        "split": "train", "model": "generator-a", "labels": [{"start": 0}],
-        "quality": "good", "temperature": 0.7,
-    }])
+    _jsonl(
+        sources,
+        [
+            {
+                "source_id": "s1",
+                "task_type": "Summary",
+                "source_info": evidence,
+                "prompt": f"Summarize:\n{evidence}\noutput:",
+            }
+        ],
+    )
+    _jsonl(
+        responses,
+        [
+            {
+                "id": "r1",
+                "source_id": "s1",
+                "response": "The value is eight.",
+                "split": "train",
+                "model": "generator-a",
+                "labels": [{"start": 0}],
+                "quality": "good",
+                "temperature": 0.7,
+            }
+        ],
+    )
+    eligible = _eligible_ids(tmp_path / "eligible.jsonl", responses, sources, "r1")
     tokenizer = CharacterTokenizer()
     model = FakeObserver().eval()
     monkeypatch.setattr(experiment, "_tokenizer_only", lambda config: tokenizer)
     monkeypatch.setattr(experiment, "_load_observer", lambda config: (tokenizer, model))
     monkeypatch.setattr(experiment, "LlamaKVMediationBackend", FakeBackend)
 
-    manifest = run_pilot(PilotConfig(
-        responses=responses, sources=sources, model=model_path, output_dir=output,
-        num_samples=1, device="cpu", dtype="float32", max_counterfactuals=2,
-    ))
+    manifest = run_pilot(
+        PilotConfig(
+            responses=responses,
+            sources=sources,
+            model=model_path,
+            output_dir=output,
+            eligible_response_ids=eligible,
+            num_samples=1,
+            device="cpu",
+            dtype="float32",
+            max_counterfactuals=2,
+        )
+    )
 
     assert manifest["run_state"] == "complete"
     assert manifest["gate_status"] == "partial"
     assert manifest["counts"]["mediation_complete"] == 1
-    effects = [json.loads(line) for line in (output / "effects.jsonl").read_text().splitlines()]
+    effects = [
+        json.loads(line) for line in (output / "effects.jsonl").read_text().splitlines()
+    ]
     assert effects
-    assert {"Y11", "Y00", "Y10", "Y01", "predictor_position",
-            "non_history_kv_effect", "history_kv_effect"} <= effects[0].keys()
-    for artifact in ("manifest.json", "selection.jsonl", "counterfactual_audit.jsonl",
-                     "effects.jsonl", "gate_report.json"):
+    assert {
+        "Y11",
+        "Y00",
+        "Y10",
+        "Y01",
+        "predictor_position",
+        "non_history_kv_effect",
+        "history_kv_effect",
+    } <= effects[0].keys()
+    teacher = [
+        json.loads(line)
+        for line in (output / "transport_teacher.jsonl").read_text().splitlines()
+    ]
+    assert teacher[0]["changed_evidence_positions"]
+    assert teacher[0]["block_definitions"]
+    assert teacher[0]["observer_runtime"] == {
+        "schema": "cept-observer-runtime-v1",
+        "transformers_version": manifest["runtime"]["transformers_version"],
+        "torch_version": manifest["runtime"]["torch_version"],
+        "dtype": "float32",
+        "attn_implementation": "eager",
+    }
+    assert teacher[0]["observer_runtime_signature"].startswith("sha256:")
+    assert manifest["teacher_manifest"]["observer_runtime"] == teacher[0][
+        "observer_runtime"
+    ]
+    assert manifest["run_contract"]["sampling_frame"] == {
+        "count": 1,
+        "path": str(eligible.resolve()),
+        "sha256": experiment.file_sha256(eligible),
+    }
+    assert manifest["run_contract"]["estimand_scope"]["generator_models"] == {
+        "generator-a": 1
+    }
+    for artifact in (
+        "manifest.json",
+        "selection.jsonl",
+        "counterfactual_audit.jsonl",
+        "effects.jsonl",
+        "transport_teacher.jsonl",
+        "gate_report.json",
+    ):
         text = (output / artifact).read_text(encoding="utf-8").casefold()
         assert '"labels"' not in text
         assert '"quality"' not in text
@@ -131,9 +250,7 @@ def test_interrupted_run_resumes_verified_sample_shard(
     model_path = tmp_path / "model"
     output = tmp_path / "output"
     model_path.mkdir()
-    (model_path / "config.json").write_text(
-        '{"model_type":"llama"}', encoding="utf-8"
-    )
+    (model_path / "config.json").write_text('{"model_type":"llama"}', encoding="utf-8")
     evidence = "The measured value is 8."
     _jsonl(
         sources,
@@ -158,6 +275,7 @@ def test_interrupted_run_resumes_verified_sample_shard(
             }
         ],
     )
+    eligible = _eligible_ids(tmp_path / "eligible.jsonl", responses, sources, "r1")
     tokenizer = CharacterTokenizer()
     model = FakeObserver().eval()
     monkeypatch.setattr(experiment, "_tokenizer_only", lambda config: tokenizer)
@@ -168,6 +286,7 @@ def test_interrupted_run_resumes_verified_sample_shard(
         sources=sources,
         model=model_path,
         output_dir=output,
+        eligible_response_ids=eligible,
         num_samples=1,
         device="cpu",
         dtype="float32",
@@ -196,6 +315,12 @@ def test_interrupted_run_resumes_verified_sample_shard(
     monkeypatch.setattr(experiment, "run_gate1_pilot", forbidden_recompute)
     monkeypatch.setattr(experiment, "_load_observer", forbidden_recompute)
     monkeypatch.setattr(experiment, "_cuda_preflight", forbidden_recompute)
+    original_frame = eligible.read_text(encoding="utf-8")
+    changed_frame = original_frame.replace("attention_r1.pt", "attention_changed.pt")
+    eligible.write_text(changed_frame, encoding="utf-8")
+    with pytest.raises(RuntimeError, match="resume contract mismatch"):
+        run_pilot(replace(config, resume=True))
+    eligible.write_text(original_frame, encoding="utf-8")
     shard_path = next((output / "gate1_shards").glob("*.json"))
     original_shard = shard_path.read_text(encoding="utf-8")
     tampered = json.loads(original_shard)
@@ -204,11 +329,7 @@ def test_interrupted_run_resumes_verified_sample_shard(
     with pytest.raises(RuntimeError, match="shard content hash mismatch"):
         run_pilot(replace(config, resume=True))
     tampered["shard_content_sha256"] = experiment.canonical_hash(
-        {
-            key: value
-            for key, value in tampered.items()
-            if key != "shard_content_sha256"
-        }
+        {key: value for key, value in tampered.items() if key != "shard_content_sha256"}
     )
     shard_path.write_text(json.dumps(tampered), encoding="utf-8")
     with pytest.raises(RuntimeError, match="response_idx disagrees"):
@@ -228,15 +349,39 @@ def test_resume_requires_existing_matching_manifest_without_polluting_it(
     sources = tmp_path / "source_info.jsonl"
     model = tmp_path / "model"
     output = tmp_path / "output"
-    responses.write_text("{}\n", encoding="utf-8")
-    sources.write_text("{}\n", encoding="utf-8")
+    _jsonl(
+        sources,
+        [
+            {
+                "source_id": "s1",
+                "task_type": "Summary",
+                "source_info": "The measured value is 8.",
+                "prompt": "Summarize: The measured value is 8.",
+            }
+        ],
+    )
+    _jsonl(
+        responses,
+        [
+            {
+                "id": "r1",
+                "source_id": "s1",
+                "response": "The value is eight.",
+                "split": "train",
+                "model": "generator-a",
+            }
+        ],
+    )
     model.mkdir()
     (model / "config.json").write_text("{}\n", encoding="utf-8")
+    eligible = _eligible_ids(tmp_path / "eligible.jsonl", responses, sources, "r1")
     config = PilotConfig(
         responses=responses,
         sources=sources,
         model=model,
         output_dir=output,
+        eligible_response_ids=eligible,
+        num_samples=1,
         device="cpu",
         resume=True,
     )
@@ -264,6 +409,7 @@ def test_pilot_rejects_sequence_ceiling_above_audited_limit(tmp_path: Path) -> N
     responses.write_text("", encoding="utf-8")
     sources.write_text("", encoding="utf-8")
     model.mkdir()
+    eligible = _eligible_ids(tmp_path / "eligible.jsonl", responses, sources, "r1")
 
     with pytest.raises(ValueError, match="2048"):
         PilotConfig(
@@ -271,5 +417,172 @@ def test_pilot_rejects_sequence_ceiling_above_audited_limit(tmp_path: Path) -> N
             sources=sources,
             model=model,
             output_dir=tmp_path / "out",
+            eligible_response_ids=eligible,
             max_sequence_tokens=4096,
         ).validate()
+
+
+def test_pilot_filters_to_verified_cache_frame_before_balanced_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    responses = tmp_path / "response.jsonl"
+    sources = tmp_path / "source_info.jsonl"
+    model_path = tmp_path / "model"
+    output = tmp_path / "output"
+    model_path.mkdir()
+    (model_path / "config.json").write_text('{"model_type":"llama"}', encoding="utf-8")
+    _jsonl(
+        sources,
+        [
+            {
+                "source_id": "s-cache",
+                "task_type": "Summary",
+                "source_info": "The measured value is 8.",
+                "prompt": "Summarize: The measured value is 8.",
+            },
+            {
+                "source_id": "s-other",
+                "task_type": "Summary",
+                "source_info": "The measured value is 9.",
+                "prompt": "Summarize: The measured value is 9.",
+            },
+        ],
+    )
+    _jsonl(
+        responses,
+        [
+            {
+                "id": "r-cache",
+                "source_id": "s-cache",
+                "response": "The value is eight.",
+                "split": "train",
+                "model": "llama-2-7b-chat",
+            },
+            {
+                "id": "r-other",
+                "source_id": "s-other",
+                "response": "The value is nine.",
+                "split": "train",
+                "model": "mistral-7b-instruct",
+            },
+        ],
+    )
+    eligible = _eligible_ids(
+        tmp_path / "eligible.jsonl",
+        responses,
+        sources,
+        "r-cache",
+        generator_model_selector="llama-2-7b-chat",
+    )
+    tokenizer = CharacterTokenizer()
+    model = FakeObserver().eval()
+    monkeypatch.setattr(experiment, "_tokenizer_only", lambda config: tokenizer)
+    monkeypatch.setattr(experiment, "_load_observer", lambda config: (tokenizer, model))
+    monkeypatch.setattr(experiment, "LlamaKVMediationBackend", FakeBackend)
+
+    manifest = run_pilot(
+        PilotConfig(
+            responses=responses,
+            sources=sources,
+            model=model_path,
+            output_dir=output,
+            eligible_response_ids=eligible,
+            num_samples=1,
+            device="cpu",
+            dtype="float32",
+        )
+    )
+
+    selection = [
+        json.loads(line)
+        for line in (output / "selection.jsonl").read_text().splitlines()
+    ]
+    assert [row["response_id"] for row in selection] == ["r-cache"]
+    assert manifest["run_contract"]["estimand_scope"] == {
+        "dataset": "RAGTruth",
+        "cache_manifest_path": "fixture/train/manifest.json",
+        "cache_manifest_sha256": "0" * 64,
+        "eligible_population": "verified_train_attention_cache_inventory",
+        "generator_models": {"llama-2-7b-chat": 1},
+        "generator_model_selector": "llama-2-7b-chat",
+        "official_split": "train",
+        "selection_policy": "task_generator_round_robin_source_unique_sha256_v1",
+        "task_type_selector": "all",
+    }
+
+
+def test_pilot_rejects_request_larger_than_verified_cache_frame(
+    tmp_path: Path,
+) -> None:
+    responses = tmp_path / "response.jsonl"
+    sources = tmp_path / "source_info.jsonl"
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}\n", encoding="utf-8")
+    responses.write_text("{}\n", encoding="utf-8")
+    sources.write_text("{}\n", encoding="utf-8")
+    eligible = _eligible_ids(tmp_path / "eligible.jsonl", responses, sources, "r1")
+
+    with pytest.raises(ValueError, match="exceeds eligible cache frame"):
+        run_pilot(
+            PilotConfig(
+                responses=responses,
+                sources=sources,
+                model=model,
+                output_dir=tmp_path / "output",
+                eligible_response_ids=eligible,
+                num_samples=2,
+                device="cpu",
+            )
+        )
+
+
+def test_pilot_rejects_sampling_frame_from_different_dataset_bytes(
+    tmp_path: Path,
+) -> None:
+    responses = tmp_path / "response.jsonl"
+    sources = tmp_path / "source_info.jsonl"
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}\n", encoding="utf-8")
+    _jsonl(
+        sources,
+        [
+            {
+                "source_id": "s1",
+                "task_type": "Summary",
+                "source_info": "evidence",
+                "prompt": "prompt",
+            }
+        ],
+    )
+    _jsonl(
+        responses,
+        [
+            {
+                "id": "r1",
+                "source_id": "s1",
+                "response": "before",
+                "split": "train",
+                "model": "generator-a",
+            }
+        ],
+    )
+    eligible = _eligible_ids(tmp_path / "eligible.jsonl", responses, sources, "r1")
+    responses.write_text(
+        responses.read_text(encoding="utf-8").replace("before", "after"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="dataset hashes disagree"):
+        run_pilot(
+            PilotConfig(
+                responses=responses,
+                sources=sources,
+                model=model,
+                output_dir=tmp_path / "output",
+                eligible_response_ids=eligible,
+                num_samples=1,
+                device="cpu",
+            )
+        )

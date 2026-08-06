@@ -53,10 +53,19 @@ def test_runner_preserves_existing_overrides_and_adds_a_venv_override():
         "DTYPE",
         "RUN_TAG",
         "OUTPUT_DIR",
+        "ELIGIBLE_RESPONSE_IDS",
         "INSTALL_DEPS",
         "RESUME",
     ):
         assert f"${{{variable}:-" in source
+
+
+def test_runner_collects_history_rescue_targets_by_default():
+    source = _runner_source()
+
+    assert 'HISTORY_BLOCK_SIZE="${HISTORY_BLOCK_SIZE:-4}"' in source
+    assert 'MAX_HISTORY_BLOCKS="${MAX_HISTORY_BLOCKS:-8}"' in source
+    assert '--eligible-response-ids "${ELIGIBLE_RESPONSE_IDS}"' in source
 
 
 def test_runner_uses_atomic_new_output_and_verified_resume_mode():
@@ -67,15 +76,15 @@ def test_runner_uses_atomic_new_output_and_verified_resume_mode():
     assert "RESUME_ARGS=(--resume)" in source
     assert 'if ! mkdir "${OUTPUT_DIR}"' in source
     assert 'tee -a "${OUTPUT_DIR}/run.log"' in source
-    assert 'flock -n 8' in source
+    assert "flock -n 8" in source
 
 
 def test_runner_serializes_venv_install_and_binds_its_base_identity():
     source = _runner_source()
 
-    assert 'flock -x 9' in source
-    assert 'CEPT_VENV}.bootstrap.lock' in source
-    assert '.cept-base-identity.json' in source
+    assert "flock -x 9" in source
+    assert "CEPT_VENV}.bootstrap.lock" in source
+    assert ".cept-base-identity.json" in source
     assert '"python": str(Path(sys.executable).resolve())' in source
     assert '"torch_version": torch.__version__' in source
     assert '"torch_cuda_version": torch.version.cuda' in source

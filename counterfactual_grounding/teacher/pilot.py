@@ -66,6 +66,11 @@ class TokenMediationEffect:
     alternate: float
     interaction: float
     contract_residual: float
+    direct_seed_rescue: float
+    joint_seed_history_rescue: float
+    representation_residual: float
+    seed_history_interaction: float
+    self_patch_error: float
     block_rescue: dict[str, float]
 
     @property
@@ -169,13 +174,21 @@ def _scalar_rows(
     y00: torch.Tensor,
     y10: torch.Tensor,
     y01: torch.Tensor,
+    direct_seed_rescue: torch.Tensor,
+    joint_seed_history_rescue: torch.Tensor,
+    representation_residual: torch.Tensor,
+    seed_history_interaction: torch.Tensor,
+    self_patch_error: torch.Tensor,
     block_values: Mapping[str, torch.Tensor],
 ) -> Gate1Record:
     response_idx = int(target_positions[0])
     target_list = target_positions.detach().cpu().tolist()
-    target_ids = input_ids.detach().cpu()[0].index_select(
-        0, target_positions.detach().cpu()
-    ).tolist()
+    target_ids = (
+        input_ids.detach()
+        .cpu()[0]
+        .index_select(0, target_positions.detach().cpu())
+        .tolist()
+    )
     scalar_vectors = {
         "y11": y11.detach().cpu()[0].tolist(),
         "y00": y00.detach().cpu()[0].tolist(),
@@ -187,10 +200,18 @@ def _scalar_rows(
         "alternate": effects.alternate_mediated.detach().cpu()[0].tolist(),
         "interaction": effects.interaction.detach().cpu()[0].tolist(),
         "residual": effects.contract_residual.detach().cpu()[0].tolist(),
+        "direct_seed_rescue": direct_seed_rescue.detach().cpu()[0].tolist(),
+        "joint_seed_history_rescue": (
+            joint_seed_history_rescue.detach().cpu()[0].tolist()
+        ),
+        "representation_residual": representation_residual.detach().cpu()[0].tolist(),
+        "seed_history_interaction": (
+            seed_history_interaction.detach().cpu()[0].tolist()
+        ),
+        "self_patch_error": self_patch_error.detach().cpu()[0].tolist(),
     }
     blocks = {
-        name: values.detach().cpu()[0].tolist()
-        for name, values in block_values.items()
+        name: values.detach().cpu()[0].tolist() for name, values in block_values.items()
     }
     rows: list[TokenMediationEffect] = []
     for offset, position in enumerate(target_list):
@@ -209,6 +230,17 @@ def _scalar_rows(
                 alternate=float(scalar_vectors["alternate"][offset]),
                 interaction=float(scalar_vectors["interaction"][offset]),
                 contract_residual=float(scalar_vectors["residual"][offset]),
+                direct_seed_rescue=float(scalar_vectors["direct_seed_rescue"][offset]),
+                joint_seed_history_rescue=float(
+                    scalar_vectors["joint_seed_history_rescue"][offset]
+                ),
+                representation_residual=float(
+                    scalar_vectors["representation_residual"][offset]
+                ),
+                seed_history_interaction=float(
+                    scalar_vectors["seed_history_interaction"][offset]
+                ),
+                self_patch_error=float(scalar_vectors["self_patch_error"][offset]),
                 block_rescue={
                     name: float(values[offset]) for name, values in blocks.items()
                 },
@@ -288,12 +320,15 @@ def run_gate1_pilot(
         history_positions = torch.arange(
             audit.response_idx, audit.token_count - 1, dtype=torch.long
         )
+        capture_positions = torch.unique(
+            torch.cat([audit.changed_positions, history_positions]), sorted=True
+        )
 
         y11 = backend.run(
             input_ids=factual_ids,
             attention_mask=attention_mask,
             target_positions=target_positions,
-            capture_positions=history_positions,
+            capture_positions=capture_positions,
         )
         _report_condition(
             condition_progress,
@@ -305,7 +340,7 @@ def run_gate1_pilot(
             input_ids=counterfactual_ids,
             attention_mask=attention_mask,
             target_positions=target_positions,
-            capture_positions=history_positions,
+            capture_positions=capture_positions,
         )
         _report_condition(
             condition_progress,
@@ -341,6 +376,7 @@ def run_gate1_pilot(
             condition="Y01",
             run=y01,
         )
+        self_patch_error = torch.zeros_like(y11.target_log_probs)
         if audit_self_patch:
             factual_self = backend.run(
                 input_ids=factual_ids,
@@ -370,9 +406,7 @@ def run_gate1_pilot(
             )
             current_max = max(
                 float(
-                    (factual_self.target_log_probs - y11.target_log_probs)
-                    .abs()
-                    .max()
+                    (factual_self.target_log_probs - y11.target_log_probs).abs().max()
                 ),
                 float(
                     (counterfactual_self.target_log_probs - y00.target_log_probs)
@@ -382,6 +416,10 @@ def run_gate1_pilot(
             )
             assert self_patch_max_abs is not None
             self_patch_max_abs = max(self_patch_max_abs, current_max)
+            self_patch_error = torch.maximum(
+                (factual_self.target_log_probs - y11.target_log_probs).abs(),
+                (counterfactual_self.target_log_probs - y00.target_log_probs).abs(),
+            )
             if current_max > 1e-5:
                 raise RuntimeError(
                     "self-patch changed target log-probabilities beyond tolerance"
@@ -401,6 +439,42 @@ def run_gate1_pilot(
             raise RuntimeError(
                 "first response token acquired an impossible history-mediated effect"
             )
+
+        direct_seed = backend.run(
+            input_ids=counterfactual_ids,
+            attention_mask=attention_mask,
+            target_positions=target_positions,
+            sender=y11.kv,
+            patch_positions=audit.changed_positions,
+        )
+        _report_condition(
+            condition_progress,
+            sample_id=pair.sample_id,
+            condition="direct_seed_rescue",
+            run=direct_seed,
+        )
+        direct_seed_rescue = direct_seed.target_log_probs - y00.target_log_probs
+
+        joint_seed_history = backend.run(
+            input_ids=counterfactual_ids,
+            attention_mask=attention_mask,
+            target_positions=target_positions,
+            sender=y11.kv,
+            patch_positions=capture_positions,
+        )
+        _report_condition(
+            condition_progress,
+            sample_id=pair.sample_id,
+            condition="joint_seed_history_rescue",
+            run=joint_seed_history,
+        )
+        joint_seed_history_rescue = (
+            joint_seed_history.target_log_probs - y00.target_log_probs
+        )
+        representation_residual = effects.total - joint_seed_history_rescue
+        seed_history_interaction = (
+            joint_seed_history_rescue - direct_seed_rescue - effects.alternate_mediated
+        )
 
         block_values: dict[str, torch.Tensor] = {}
         for name, raw_positions in pair.rescue_blocks.items():
@@ -432,6 +506,11 @@ def run_gate1_pilot(
                 y00=y00.target_log_probs,
                 y10=y10.target_log_probs,
                 y01=y01.target_log_probs,
+                direct_seed_rescue=direct_seed_rescue,
+                joint_seed_history_rescue=joint_seed_history_rescue,
+                representation_residual=representation_residual,
+                seed_history_interaction=seed_history_interaction,
+                self_patch_error=self_patch_error,
                 block_values=block_values,
             )
         )
@@ -461,6 +540,18 @@ def run_gate1_pilot(
             "mediated": "Y11 - Y10: response-history K/V-mediated effect",
             "alternate": "Y01 - Y00: reverse-direction mediation check",
             "interaction": "mediated - alternate: direction sensitivity check",
+            "direct_seed_rescue": (
+                "Y(E0, patch changed evidence K/V from E1) - Y00: total recursive "
+                "support initiated by the changed-evidence seed"
+            ),
+            "joint_seed_history_rescue": (
+                "Y(E0, patch changed-evidence and response-history K/V from E1) "
+                "- Y00: graph-variable representable joint rescue"
+            ),
+            "representation_residual": ("total effect - joint seed/history rescue"),
+            "seed_history_interaction": (
+                "joint rescue - direct-seed rescue - alternate history rescue"
+            ),
         },
         counterfactual_protocol="numeric_digit_surface_preserving_v1",
         self_patch_max_abs=self_patch_max_abs,

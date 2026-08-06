@@ -77,11 +77,7 @@ def _assert_evidence_and_query_partition(
 class RagTruthLayoutGate0Tests(unittest.TestCase):
     def test_summary_source_info_is_the_exact_evidence_span(self):
         source_info = "Ada wrote the first published algorithm."
-        prompt = (
-            "Summarize the following note in ten words:\n"
-            f"{source_info}\n\n"
-            "output:"
-        )
+        prompt = f"Summarize the following note in ten words:\n{source_info}\n\noutput:"
         record = {
             "source_id": "summary-1",
             "task_type": "Summary",
@@ -163,9 +159,7 @@ class RagTruthLayoutGate0Tests(unittest.TestCase):
             "passage 2:The launch code is 314.\n\n"
             "passage 3:No other code is listed.\n\n"
         )
-        prompt = (
-            f"Briefly answer:\n{question}\nUse these passages:\n{passages}output:"
-        )
+        prompt = f"Briefly answer:\n{question}\nUse these passages:\n{passages}output:"
         layout = build_ragtruth_layout(
             {
                 "source_id": "qa-duplicate-question",
@@ -187,7 +181,9 @@ class RagTruthLayoutGate0Tests(unittest.TestCase):
             )
         )
 
-    def test_data2txt_python_literal_is_structurally_equal_to_source_info_and_evidence(self):
+    def test_data2txt_python_literal_is_structurally_equal_to_source_info_and_evidence(
+        self,
+    ):
         source_info = {
             "name": "Cafe Example",
             "open": True,
@@ -255,7 +251,9 @@ class RagTruthLayoutGate0Tests(unittest.TestCase):
         )
 
         expected_evidence_positions = list(
-            range(prompt.index(source_info), prompt.index(source_info) + len(source_info))
+            range(
+                prompt.index(source_info), prompt.index(source_info) + len(source_info)
+            )
         )
         self.assertEqual(
             _as_list(layout.evidence_token_positions), expected_evidence_positions
@@ -265,7 +263,9 @@ class RagTruthLayoutGate0Tests(unittest.TestCase):
             expected_evidence_positions,
         )
 
-    def test_data2txt_rejects_a_structured_literal_that_disagrees_with_source_info(self):
+    def test_data2txt_rejects_a_structured_literal_that_disagrees_with_source_info(
+        self,
+    ):
         record = {
             "source_id": "data2txt-mismatch",
             "task_type": "Data2txt",

@@ -15,22 +15,20 @@ def _factual_record() -> dict[str, object]:
     return {
         "source_id": "source-1",
         "response_id": "response-1",
-        "input_ids": torch.tensor(
-            [101, 102, 201, 202, 301, 302], dtype=torch.long
-        ),
+        "input_ids": torch.tensor([101, 102, 201, 202, 301, 302], dtype=torch.long),
         "response_idx": 4,
         "evidence_token_positions": torch.tensor([2, 3], dtype=torch.long),
     }
 
 
 class CounterfactualTokenContractGate0Tests(unittest.TestCase):
-    def test_equal_token_length_evidence_replacement_preserves_response_predictors(self):
+    def test_equal_token_length_evidence_replacement_preserves_response_predictors(
+        self,
+    ):
         factual = _factual_record()
         counterfactual = {
             **factual,
-            "input_ids": torch.tensor(
-                [101, 102, 211, 212, 301, 302], dtype=torch.long
-            ),
+            "input_ids": torch.tensor([101, 102, 211, 212, 301, 302], dtype=torch.long),
         }
 
         audit = validate_counterfactual_pair(factual, counterfactual)
@@ -58,9 +56,7 @@ class CounterfactualTokenContractGate0Tests(unittest.TestCase):
         factual = _factual_record()
         counterfactual = {
             **factual,
-            "input_ids": torch.tensor(
-                [101, 102, 211, 301, 302, 303], dtype=torch.long
-            ),
+            "input_ids": torch.tensor([101, 102, 211, 301, 302, 303], dtype=torch.long),
             "response_idx": 3,
             "evidence_token_positions": torch.tensor([2], dtype=torch.long),
         }
@@ -75,9 +71,7 @@ class CounterfactualTokenContractGate0Tests(unittest.TestCase):
         counterfactual = {
             **factual,
             # Position 1 is query, so this is not a minimal evidence-only edit.
-            "input_ids": torch.tensor(
-                [101, 999, 211, 212, 301, 302], dtype=torch.long
-            ),
+            "input_ids": torch.tensor([101, 999, 211, 212, 301, 302], dtype=torch.long),
         }
 
         with self.assertRaisesRegex(ValueError, "evidence|changed position"):
@@ -88,9 +82,7 @@ class CounterfactualTokenContractGate0Tests(unittest.TestCase):
         factual["hallucination_labels"] = torch.tensor([0, 1])
         counterfactual = {
             **_factual_record(),
-            "input_ids": torch.tensor(
-                [101, 102, 211, 212, 301, 302], dtype=torch.long
-            ),
+            "input_ids": torch.tensor([101, 102, 211, 212, 301, 302], dtype=torch.long),
         }
 
         with self.assertRaisesRegex(ValueError, "label|label-blind|forbidden"):

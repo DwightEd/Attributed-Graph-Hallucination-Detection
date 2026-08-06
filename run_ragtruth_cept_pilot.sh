@@ -23,13 +23,14 @@ SEED="${SEED:-42}"
 NUM_SAMPLES="${NUM_SAMPLES:-50}"
 MAX_SEQUENCE_TOKENS="${MAX_SEQUENCE_TOKENS:-2048}"
 MAX_COUNTERFACTUALS="${MAX_COUNTERFACTUALS:-2}"
-HISTORY_BLOCK_SIZE="${HISTORY_BLOCK_SIZE:-0}"
-MAX_HISTORY_BLOCKS="${MAX_HISTORY_BLOCKS:-0}"
+HISTORY_BLOCK_SIZE="${HISTORY_BLOCK_SIZE:-4}"
+MAX_HISTORY_BLOCKS="${MAX_HISTORY_BLOCKS:-8}"
 GPU_ID="${GPU_ID:-0}"
 DEVICE="${DEVICE:-cuda:0}"
 DTYPE="${DTYPE:-float16}"
 RUN_TAG="${RUN_TAG:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUTPUT_DIR="${OUTPUT_DIR:-${FEATURE_ROOT}/ragtruth_cept_gate01_${RUN_TAG}_seed${SEED}}"
+ELIGIBLE_RESPONSE_IDS="${ELIGIBLE_RESPONSE_IDS:-}"
 INSTALL_DEPS="${INSTALL_DEPS:-1}"
 RESUME="${RESUME:-0}"
 
@@ -38,10 +39,16 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
+if [[ -z "${ELIGIBLE_RESPONSE_IDS}" ]]; then
+  printf 'ELIGIBLE_RESPONSE_IDS is required and must come from a verified train cache inventory.\n' >&2
+  exit 1
+fi
+
 for required in \
   "${DATASET_DIR}/response.jsonl" \
   "${DATASET_DIR}/source_info.jsonl" \
-  "${MODEL_PATH}/config.json"; do
+  "${MODEL_PATH}/config.json" \
+  "${ELIGIBLE_RESPONSE_IDS}"; do
   if [[ ! -f "${required}" ]]; then
     printf 'Missing CEPT input: %s\n' "${required}" >&2
     exit 1
@@ -207,6 +214,8 @@ printf 'method=CEPT Gate0/1 (no training, no AUROC)\n'
 printf 'dataset=%s model=%s\n' "${DATASET_DIR}" "${MODEL_PATH}"
 printf 'samples=%s seed=%s device=%s dtype=%s\n' \
   "${NUM_SAMPLES}" "${SEED}" "${DEVICE}" "${DTYPE}"
+printf 'history_block_size=%s max_history_blocks=%s\n' \
+  "${HISTORY_BLOCK_SIZE}" "${MAX_HISTORY_BLOCKS}"
 printf 'output=%s\n' "${OUTPUT_DIR}"
 
 "${CEPT_PYTHON}" -u -m counterfactual_grounding.cli pilot \
@@ -214,6 +223,7 @@ printf 'output=%s\n' "${OUTPUT_DIR}"
   --sources "${DATASET_DIR}/source_info.jsonl" \
   --model "${MODEL_PATH}" \
   --output-dir "${OUTPUT_DIR}" \
+  --eligible-response-ids "${ELIGIBLE_RESPONSE_IDS}" \
   --split train \
   --num-samples "${NUM_SAMPLES}" \
   --seed "${SEED}" \

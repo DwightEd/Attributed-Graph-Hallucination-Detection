@@ -18,8 +18,15 @@ def _layout() -> RagTruthTokenLayout:
         rendered_text="abcdefg",
         input_ids=torch.tensor([1, 2, 3, 4, 5, 6, 7]),
         segment_ids=torch.tensor(
-            [Segment.QUERY, Segment.QUERY, Segment.EVIDENCE, Segment.EVIDENCE,
-             Segment.RESPONSE, Segment.RESPONSE, Segment.RESPONSE],
+            [
+                Segment.QUERY,
+                Segment.QUERY,
+                Segment.EVIDENCE,
+                Segment.EVIDENCE,
+                Segment.RESPONSE,
+                Segment.RESPONSE,
+                Segment.RESPONSE,
+            ],
             dtype=torch.int8,
         ),
         response_idx=4,
@@ -39,9 +46,7 @@ def _raw() -> dict[str, object]:
         "num_attention_heads": 1,
         "attention_floor": 0.01,
         "token_ids": torch.tensor([1, 2, 3, 4, 5, 6, 7]),
-        "attention_diagonal": torch.tensor(
-            [[[0.1, 0.1, 0.1, 0.1, 0.3, 0.3, 0.3]]]
-        ),
+        "attention_diagonal": torch.tensor([[[0.1, 0.1, 0.1, 0.1, 0.3, 0.3, 0.3]]]),
         "response_row_ptr": torch.tensor([0, 1, 2, 3]),
         "response_column_indices": torch.tensor([0, 1, 2]),
         "response_values": torch.tensor([0.2, 0.2, 0.2]),
@@ -59,9 +64,7 @@ def test_legacy_adapter_whitelists_cache_fields_and_never_copies_labels():
 
 
 def test_canonical_graph_is_saved_once_with_no_label_fields(tmp_path: Path):
-    adapted = adapt_legacy_cache_to_layout(
-        _raw(), _layout(), cache_sha256="a" * 64
-    )
+    adapted = adapt_legacy_cache_to_layout(_raw(), _layout(), cache_sha256="a" * 64)
     graph = build_prediction_event_graph(adapted)
 
     first = save_prediction_event_graph(graph, tmp_path)
@@ -84,14 +87,10 @@ def test_canonical_path_changes_when_layout_changes_under_the_same_cache_sha(
     cache_sha256 = "b" * 64
 
     factual_graph = build_prediction_event_graph(
-        adapt_legacy_cache_to_layout(
-            _raw(), factual_layout, cache_sha256=cache_sha256
-        )
+        adapt_legacy_cache_to_layout(_raw(), factual_layout, cache_sha256=cache_sha256)
     )
     revised_graph = build_prediction_event_graph(
-        adapt_legacy_cache_to_layout(
-            _raw(), revised_layout, cache_sha256=cache_sha256
-        )
+        adapt_legacy_cache_to_layout(_raw(), revised_layout, cache_sha256=cache_sha256)
     )
 
     factual = save_prediction_event_graph(factual_graph, tmp_path)
