@@ -23,7 +23,7 @@ class TopologyFlowEvaluationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             response_path = root / "response.jsonl"
-            source_path = root  / "source.jsonl"
+            source_path = root / "source.jsonl"
             score_path = root / "scores.jsonl"
             output_path = root / "evaluation.json"
             response_path.write_text("\n".join(json.dumps(row) for row in responses) + "\n")
@@ -38,7 +38,46 @@ class TopologyFlowEvaluationTests(unittest.TestCase):
 
         self.assertEqual(report["overall"]["auroc"], 1.0)
         self.assertEqual(report["overall"]["average_precision"], 1.0)
-        self.assertTrue(output_path.exists() is False)  # temporary directory is gone
+        self.assertTrue(output_path.exists() is False)
+
+    def test_response_id_join_when_original_idx_is_absent(self):
+        scores = [
+            {"sample_id": "r0", "source_id": "s0", "topology_anomaly_score": 0.1},
+            {"sample_id": "r1", "source_id": "s1", "topology_anomaly_score": 0.9},
+        ]
+        responses = [
+            {
+                "response_id": "r0",
+                "source_id": "s0",
+                "model": "m",
+                "split": "test",
+                "labels": [],
+            },
+            {
+                "response_id": "r1",
+                "source_id": "s1",
+                "model": "m",
+                "split": "test",
+                "labels": [{"start": 0}],
+            },
+        ]
+        sources = [
+            {"source_id": "s0", "task_type": "QA"},
+            {"source_id": "s1", "task_type": "QA"},
+        ]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            response_path = root / "response.jsonl"
+            source_path = root / "source.jsonl"
+            response_path.write_text("\n".join(json.dumps(row) for row in responses) + "\n")
+            source_path.write_text("\n".join(json.dumps(row) for row in sources) + "\n")
+            joined = join_ragtruth_scores(
+                scores, response_path=response_path, source_path=source_path
+            )
+        self.assertEqual([row["original_idx"] for row in joined], [0, 1])
+        self.assertTrue(
+            all(row["evaluation_join_key"] == "response_id" for row in joined)
+        )
 
     def test_score_records_with_labels_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
