@@ -2,8 +2,8 @@ from pathlib import Path
 
 import torch
 
+from attention_cache import load_attention
 from patf.config import CorruptionConfig, TopologyConfig
-from patf.data import load_attention
 from patf.topology import FEATURE_NAMES, extract_trajectories
 
 from .conftest import write_cache
@@ -18,9 +18,10 @@ def test_topology_and_counterfactual_shapes(tmp_path: Path) -> None:
         corruption=CorruptionConfig(),
         modes=("incidence", "collapse", "composite"),
     )
-    assert set(trajectories) == {"original", "incidence", "collapse", "composite"}
+    assert set(trajectories) == {
+        "original", "incidence", "collapse", "composite"
+    }
     assert trajectories["original"].shape == (2, len(FEATURE_NAMES))
-
     prompt = FEATURE_NAMES.index("head_center::direct_prompt_mass")
     sparse = FEATURE_NAMES.index("head_center::edge_sparsity")
     assert trajectories["incidence"][:, prompt].mean() < trajectories["original"][:, prompt].mean()
@@ -40,7 +41,14 @@ def test_source_incidence_changes_prompt_ancestry(tmp_path: Path) -> None:
         torch.save(
             {
                 "attention_cache_schema": "ragtruth-all-layers-all-heads-sparse-response-csr-v1",
+                "attention_cache_fingerprint": f"fingerprint-{path.stem}",
+                "cache_dtype": "float32",
+                "input_policy": "prompt_response",
+                "was_truncated": False,
+                "attention_floor": 0.01,
+                "token_ids": torch.arange(6),
                 "source_id": "s",
+                "split": "train",
                 "response_id": path.stem,
                 "response_idx": 2,
                 "num_attention_layers": 1,
@@ -57,17 +65,12 @@ def test_source_incidence_changes_prompt_ancestry(tmp_path: Path) -> None:
     weak_path = tmp_path / "weak.pt"
     save(strong_path, 2)
     save(weak_path, 4)
-    strong = extract_trajectories(
-        load_attention(strong_path),
-        topology=TopologyConfig(),
-        corruption=CorruptionConfig(),
-    )["original"]
-    weak = extract_trajectories(
-        load_attention(weak_path),
-        topology=TopologyConfig(),
-        corruption=CorruptionConfig(),
-    )["original"]
-
+    kwargs = {
+        "topology": TopologyConfig(),
+        "corruption": CorruptionConfig(),
+    }
+    strong = extract_trajectories(load_attention(strong_path), **kwargs)["original"]
+    weak = extract_trajectories(load_attention(weak_path), **kwargs)["original"]
     ancestry = FEATURE_NAMES.index("head_center::discounted_prompt_ancestry")
     unsupported = FEATURE_NAMES.index("head_center::unsupported_response_feedback")
     assert strong[:, ancestry].mean() > weak[:, ancestry].mean()

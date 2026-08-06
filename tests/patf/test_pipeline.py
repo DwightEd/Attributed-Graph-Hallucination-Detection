@@ -11,7 +11,7 @@ from patf.trainer import score_features, train_ranker
 from .conftest import write_cache
 
 
-def test_feature_train_score_and_evaluate(tmp_path: Path) -> None:
+def test_parallel_feature_train_score_and_evaluate(tmp_path: Path) -> None:
     train_dir = tmp_path / "attention" / "train"
     test_dir = tmp_path / "attention" / "test"
     train_dir.mkdir(parents=True)
@@ -41,6 +41,8 @@ def test_feature_train_score_and_evaluate(tmp_path: Path) -> None:
         modes=corruption.modes,
         resume=True,
         split="train",
+        workers=2,
+        torch_threads=1,
     )
     test_features = prepare_features(
         sorted(test_dir.glob("*.pt")),
@@ -50,6 +52,8 @@ def test_feature_train_score_and_evaluate(tmp_path: Path) -> None:
         modes=(),
         resume=True,
         split="test",
+        workers=2,
+        torch_threads=1,
     )
     assert len(load_feature(train_features[0])["trajectories"]) == 4
 
@@ -60,8 +64,9 @@ def test_feature_train_score_and_evaluate(tmp_path: Path) -> None:
         config=TrainConfig(epochs=2, hidden_dim=8, batch_size=4, patience=2),
         device="cpu",
     )
-    prediction_path = tmp_path / "predictions.jsonl"
-    predictions = score_features(test_features, checkpoint, prediction_path)
+    predictions = score_features(
+        test_features, checkpoint, tmp_path / "predictions.jsonl"
+    )
     assert len(predictions) == 2
 
     ragtruth = tmp_path / "ragtruth"
@@ -80,5 +85,9 @@ def test_feature_train_score_and_evaluate(tmp_path: Path) -> None:
     (ragtruth / "source_info.jsonl").write_text(
         "".join(json.dumps(row) + "\n" for row in sources), encoding="utf-8"
     )
-    report = evaluate(prediction_path, ragtruth, tmp_path / "evaluation.json")
+    report = evaluate(
+        tmp_path / "predictions.jsonl",
+        ragtruth,
+        tmp_path / "evaluation.json",
+    )
     assert report["overall"]["samples"] == 2

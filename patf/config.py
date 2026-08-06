@@ -36,6 +36,12 @@ class TrainConfig:
 
 
 @dataclass(frozen=True)
+class RuntimeConfig:
+    workers: int = 8
+    torch_threads: int = 1
+
+
+@dataclass(frozen=True)
 class ExperimentConfig:
     attention_root: str
     ragtruth_root: str
@@ -45,9 +51,14 @@ class ExperimentConfig:
     topology: TopologyConfig = field(default_factory=TopologyConfig)
     corruption: CorruptionConfig = field(default_factory=CorruptionConfig)
     training: TrainConfig = field(default_factory=TrainConfig)
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any]) -> "ExperimentConfig":
+        corruption = dict(raw.get("corruption", {}))
+        corruption["modes"] = tuple(
+            corruption.get("modes", CorruptionConfig().modes)
+        )
         return cls(
             attention_root=raw["attention_root"],
             ragtruth_root=raw["ragtruth_root"],
@@ -55,15 +66,9 @@ class ExperimentConfig:
             device=raw.get("device", "cuda"),
             resume=raw.get("resume", True),
             topology=TopologyConfig(**raw.get("topology", {})),
-            corruption=CorruptionConfig(
-                **{
-                    **raw.get("corruption", {}),
-                    "modes": tuple(raw.get("corruption", {}).get(
-                        "modes", CorruptionConfig().modes
-                    )),
-                }
-            ),
+            corruption=CorruptionConfig(**corruption),
             training=TrainConfig(**raw.get("training", {})),
+            runtime=RuntimeConfig(**raw.get("runtime", {})),
         )
 
     @classmethod

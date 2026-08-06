@@ -1,81 +1,70 @@
 # Prompt-Anchored Topology Flow
 
-PATF is a label-free hallucination detector built from saved LLM attention.
-It measures how response tokens remain connected to the prompt, constructs
-mechanism-aligned counterfactuals, and learns an anomaly score over the
-layer-wise topology trajectory.
+PATF is a label-free response-level hallucination detector built from saved
+layer/head attention. The repository keeps the supervised attributed-graph
+baseline and PATF as separate methods over one shared attention-cache API.
 
 ## Structure
 
 ```text
-main.py                 command-line entry
-configs/patf.json       method and training parameters
-scripts/run_ragtruth.sh one-command RAGTruth experiment
-patf/
-  data.py               sparse attention cache loader
-  topology.py           prompt-anchored topology features
-  augment.py            counterfactual topology erosion
-  features.py           incremental feature cache
-  model.py              trajectory ranker
-  trainer.py            training and scoring
-  evaluation.py         response-level AUROC/AUPRC
-  experiment.py         end-to-end experiment
+attention_cache/io.py   shared sparse-CSR cache access
+original/               original threshold-union attributed graph + CHARM
+patf/                   prompt-anchored topology method
+configs/patf.json       method, training, and runtime parameters
+scripts/run_patf.sh     one experiment entry
 ```
 
-The main pipeline is intentionally short:
+The original graph and PATF do not share graph construction:
 
-```python
-train_features = prepare_features(train_attention)
-checkpoint = train_ranker(train_features)
-test_features = prepare_features(test_attention)
-predictions = score_features(test_features, checkpoint)
-report = evaluate(predictions)
-```
+- `original/ragtruth_graph.py`: a token-pair edge is created when **any**
+  layer/head value is strictly greater than `tau`; `edge_attr` keeps all
+  above-threshold channels and zeros the rest. This is threshold union, not
+  max-value selection and not top-k.
+- `patf/topology.py`: no static attributed graph is saved. Each layer/head is
+  analysed separately, then aggregated into a `[layers, 30]` topology
+  trajectory.
 
-## Run
+Only the cache schema, sample identity, and CSR row access are shared through
+`attention_cache/io.py`.
+
+## Run PATF
 
 ```bash
-bash run_patf.sh
+CUDA_VISIBLE_DEVICES=0 WORKERS=8 bash scripts/run_patf.sh
 ```
 
-Default server paths can be overridden without editing code:
+Useful overrides:
 
 ```bash
 ATTENTION_ROOT=/path/to/attention_cache \
-RAGTRUTH_ROOT=/path/to/RAGTruth \
+RAGTRUTH_ROOT=/path/to/RAGTruth/dataset \
 OUTPUT_DIR=/path/to/output \
-DEVICE=cuda \
-EPOCHS=80 \
-bash run_patf.sh
+DEVICE=cuda EPOCHS=80 WORKERS=8 TORCH_THREADS=1 \
+bash scripts/run_patf.sh
 ```
+
+`WORKERS` controls sample-level multiprocessing. Each worker uses
+`TORCH_THREADS=1` by default to avoid CPU oversubscription. For shared storage,
+start with 4 or 8 workers; increasing beyond the available I/O bandwidth may
+slow the run.
 
 ## Outputs
 
 ```text
 output/
+  status.json
   config.json
+  run.log
   features/train/*.features.pt
-  features/test/*.features.pt
   model/model.pt
   model/history.json
+  features/test/*.features.pt
   predictions.jsonl
   evaluation.json
 ```
 
-Feature extraction is incremental. Existing feature files are reused when the
-method configuration matches, so interrupted runs can resume without repeating
-completed samples.
-
-## Data
-
-PATF reads the formal sparse response-attention cache:
-
-```text
-ragtruth-all-layers-all-heads-sparse-response-csr-v1
-```
-
-Labels stored in the same `.pt` file are ignored. RAGTruth labels are opened
-only by `patf/evaluation.py`, after test scores have been written.
-
-Legacy experiments remain in their original directories for reproducibility;
-they are not imported by PATF.
+Feature files are written atomically per sample and reused when both the source
+file and method configuration match. During the first stage `model/` remains
+empty because the ranker is trained only after all training trajectories are
+available; progress is visible in `features/train/`, `status.json`, and
+`run.log`.

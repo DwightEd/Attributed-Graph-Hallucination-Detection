@@ -23,5 +23,9 @@
     "validation_fraction": 0.2,
     "patience": 12,
     "seed": 42
+  },
+  "runtime": {
+    "workers": 8,
+    "torch_threads": 1
   }
 }

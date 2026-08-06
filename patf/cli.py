@@ -17,6 +17,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--device")
     parser.add_argument("--epochs", type=int)
+    parser.add_argument("--workers", type=int)
+    parser.add_argument("--torch-threads", type=int)
     parser.add_argument("--no-resume", action="store_true")
     return parser
 
@@ -32,11 +34,23 @@ def main(argv: list[str] | None = None) -> int:
     config = ExperimentConfig.from_mapping(raw)
     if args.device:
         config = replace(config, device=args.device)
-    if args.epochs:
-        config = replace(config, training=replace(config.training, epochs=args.epochs))
+    if args.epochs is not None:
+        config = replace(
+            config,
+            training=replace(config.training, epochs=args.epochs),
+        )
+    if args.workers is not None:
+        config = replace(
+            config,
+            runtime=replace(config.runtime, workers=args.workers),
+        )
+    if args.torch_threads is not None:
+        config = replace(
+            config,
+            runtime=replace(config.runtime, torch_threads=args.torch_threads),
+        )
     if args.no_resume:
         config = replace(config, resume=False)
 
-    report = run_experiment(config)
-    print(json.dumps(report, indent=2, sort_keys=True))
+    print(json.dumps(run_experiment(config), indent=2, sort_keys=True))
     return 0
