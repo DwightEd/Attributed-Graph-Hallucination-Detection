@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'status=$?; echo "PATF failed at line ${BASH_LINENO[0]} with exit code ${status}. See ${LOG_FILE:-stderr}." >&2' ERR
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
@@ -37,7 +38,7 @@ if [[ -z "${ATTENTION_ROOT}" && -d "${DEFAULT_ATTENTION_ROOT}/train" && -d "${DE
   ATTENTION_ROOT="${DEFAULT_ATTENTION_ROOT}"
 fi
 if [[ -z "${ATTENTION_ROOT}" ]]; then
-  FIRST_OLD_GRAPH="$(find "${ORIGINAL_GRAPH_ROOT}/graphs/train" -maxdepth 1 -type f -name '*.graph.pt' 2>/dev/null | sort | head -n 1 || true)"
+  FIRST_OLD_GRAPH="$(find "${ORIGINAL_GRAPH_ROOT}/graphs/train" -maxdepth 1 -type f -name '*.graph.pt' -print -quit 2>/dev/null || true)"
   if [[ -n "${FIRST_OLD_GRAPH}" ]]; then
     ATTENTION_ROOT="$(${PYTHON_BIN} - "${FIRST_OLD_GRAPH}" <<'PY'
 from pathlib import Path
@@ -85,7 +86,7 @@ if [[ "${SKIP_EVALUATION}" != "1" ]]; then
     fi
   done
 fi
-if [[ -e "${OUTPUT_DIR}" ]] && find "${OUTPUT_DIR}" -mindepth 1 -maxdepth 1 | grep -q .; then
+if [[ -e "${OUTPUT_DIR}" ]] && find "${OUTPUT_DIR}" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
   echo "OUTPUT_DIR must be new or empty: ${OUTPUT_DIR}" >&2
   exit 2
 fi
@@ -94,6 +95,7 @@ LOG_FILE="${OUTPUT_DIR}/run.log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
 export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 echo "PATF repository:       ${SCRIPT_DIR}"
@@ -111,7 +113,12 @@ echo "Corruption mode:       ${CORRUPTION_MODE}"
 
 # Show the actual raw-cache contract before expensive work. y_token may be
 # present physically; the PATF loader ignores it through a field whitelist.
-FIRST_ATTENTION="$(find "${TRAIN_ATTENTION_DIR}" -maxdepth 1 -type f -name 'attention_*.pt' | sort | head -n 1)"
+echo "[1/6] Inspecting one raw attention cache..."
+FIRST_ATTENTION="$(find "${TRAIN_ATTENTION_DIR}" -maxdepth 1 -type f -name 'attention_*.pt' -print -quit)"
+if [[ -z "${FIRST_ATTENTION}" ]]; then
+  echo "Could not select a preflight attention file from ${TRAIN_ATTENTION_DIR}" >&2
+  exit 2
+fi
 "${PYTHON_BIN}" - "${FIRST_ATTENTION}" <<'PY'
 from pathlib import Path
 import sys
@@ -132,16 +139,20 @@ print("response_values_shape=", tuple(sample["response_values"].shape))
 print("contains_y_token_but_ignored=", "y_token" in sample)
 PY
 
+echo "[2/6] Validating train attention cache..."
 "${PYTHON_BIN}" main.py validate \
   --input-dir "${TRAIN_ATTENTION_DIR}" \
   --limit "${VALIDATE_LIMIT}" \
   --output "${OUTPUT_DIR}/train.cache_validation.json"
 
+echo "[3/6] Validating test attention cache..."
 "${PYTHON_BIN}" main.py validate \
   --input-dir "${TEST_ATTENTION_DIR}" \
   --limit "${VALIDATE_LIMIT}" \
   --output "${OUTPUT_DIR}/test.cache_validation.json"
 
+echo "[4/6] Extracting topology trajectories and training the ranker..."
+echo "This stage can be quiet while all layer/head channels are processed. Follow ${LOG_FILE}."
 "${PYTHON_BIN}" main.py train \
   --input-dir "${TRAIN_ATTENTION_DIR}" \
   --output-dir "${MODEL_DIR}" \
@@ -152,12 +163,14 @@ PY
   --head-reducer "${HEAD_REDUCER}" \
   --corruption-mode "${CORRUPTION_MODE}"
 
+echo "[5/6] Scoring the test attention cache..."
 "${PYTHON_BIN}" main.py score \
   --input-dir "${TEST_ATTENTION_DIR}" \
   --checkpoint "${MODEL_DIR}/topology_flow_ranker.pt" \
   --output "${OUTPUT_DIR}/test.topology_scores.jsonl"
 
 if [[ "${SKIP_EVALUATION}" != "1" ]]; then
+  echo "[6/6] Joining frozen scores with RAGTruth labels and evaluating..."
   "${PYTHON_BIN}" main.py evaluate \
     --scores "${OUTPUT_DIR}/test.topology_scores.jsonl" \
     --responses "${RESPONSE_FILE}" \
@@ -183,6 +196,8 @@ for task, row in report.get("strata", {}).get("task", {}).items():
         f"AUPRC={row['average_precision']:.6f}"
     )
 PY
+else
+  echo "[6/6] Evaluation skipped because SKIP_EVALUATION=1."
 fi
 
 echo "PATF run complete: ${OUTPUT_DIR}"
