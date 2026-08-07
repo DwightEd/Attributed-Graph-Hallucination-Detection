@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ -z "${PYTHON_BIN:-}" ]]; then
-  PYTHON_BIN="$(command -v python || command -v python3)"
-fi
-
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python || command -v python3)}"
 SPLIT="${SPLIT:?Set SPLIT=train or SPLIT=test}"
 if [[ "${SPLIT}" != "train" && "${SPLIT}" != "test" ]]; then
   printf 'SPLIT must be train or test, got %s\n' "${SPLIT}" >&2
@@ -17,10 +14,6 @@ MODEL_PATH="${MODEL_PATH:-/share/home/tm902089733300000/a903202310/lys/models/Me
 HYPERGRAPH_PROJECT="${HYPERGRAPH_PROJECT:-/share/home/tm902089733300000/a903202310/lys/research/Unsupervised-hypergraph}"
 ATTENTION_CACHE_ROOT="${ATTENTION_CACHE_ROOT:?Set ATTENTION_CACHE_ROOT}"
 CACHE_TAG="$(basename -- "${ATTENTION_CACHE_ROOT}")"
-# The legacy fresh_hypergraphs_* files predate the mandatory cache SHA-256
-# binding.  Reusing them makes the current validator fail before it can resume
-# the attention cache, so cache-bound replay artifacts have their own stable
-# schema-specific directory.  Existing attention_*.pt files remain untouched.
 REPLAY_GRAPH_ROOT="${REPLAY_GRAPH_ROOT:-${DATA_ROOT}/RAGTruth/hypergraphs/cache_bound_sha256/${CACHE_TAG}}"
 REPLAY_GRAPH_DIR="${REPLAY_GRAPH_DIR:-${REPLAY_GRAPH_ROOT}/${SPLIT}}"
 LOG_DIR="${LOG_DIR:-${DATA_ROOT}/feature_extraction/ragtruth_original_attribute_graphs/logs/${CACHE_TAG}}"
@@ -33,26 +26,7 @@ GENERATOR_MODEL="${GENERATOR_MODEL:-llama-2-7b-chat}"
 TASK_TYPE="${TASK_TYPE:-all}"
 DEVICE="${DEVICE:-cuda}"
 
-for required_file in \
-  "${HYPERGRAPH_PROJECT}/get_response_attention.py" \
-  "${DATASET_DIR}/source_info.jsonl" \
-  "${DATASET_DIR}/response.jsonl" \
-  "${MODEL_PATH}/config.json"; do
-  if [[ ! -f "${required_file}" ]]; then
-    printf 'Missing attention extraction input: %s\n' "${required_file}" >&2
-    exit 1
-  fi
-done
-
-mkdir -p \
-  "${ATTENTION_CACHE_ROOT}/${SPLIT}" \
-  "${REPLAY_GRAPH_DIR}" \
-  "${LOG_DIR}"
-
-printf 'Resuming RAGTruth %s attention extraction.\n' "${SPLIT}"
-printf 'attention_cache=%s\n' "${ATTENTION_CACHE_ROOT}/${SPLIT}"
-printf 'replay_hypergraphs=%s\n' "${REPLAY_GRAPH_DIR}"
-
+mkdir -p "${ATTENTION_CACHE_ROOT}/${SPLIT}" "${REPLAY_GRAPH_DIR}" "${LOG_DIR}"
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
@@ -72,6 +46,3 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
   --dtype "${DTYPE}" \
   --resume-existing \
   2>&1 | tee "${LOG_DIR}/extract_${SPLIT}_attention.log"
-
-printf 'RAGTruth %s attention extraction returned: %s\n' \
-  "${SPLIT}" "${ATTENTION_CACHE_ROOT}/${SPLIT}"

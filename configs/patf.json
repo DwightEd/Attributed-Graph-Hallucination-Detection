@@ -1,0 +1,29 @@
+{
+  "device": "cuda",
+  "resume": true,
+  "flow": {
+    "residual_weight": 0.5,
+    "head_reducer": "median"
+  },
+  "corruption": {
+    "prompt_suppression": 0.45,
+    "locality_strength": 1.0,
+    "local_window": 4.0,
+    "concentration_power": 1.8
+  },
+  "training": {
+    "hidden_dim": 48,
+    "epochs": 80,
+    "batch_size": 32,
+    "learning_rate": 0.001,
+    "margin": 0.5,
+    "origin_regularization": 0.02,
+    "validation_fraction": 0.2,
+    "patience": 12,
+    "seed": 42
+  },
+  "runtime": {
+    "workers": 8,
+    "torch_threads": 1
+  }
+}
