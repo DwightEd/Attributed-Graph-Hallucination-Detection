@@ -7,18 +7,16 @@ from typing import Any
 
 
 @dataclass(frozen=True)
-class TopologyConfig:
-    mass_cover: float = 0.80
-    relay_discount: float = 0.85
+class FlowConfig:
+    residual_weight: float = 0.5
     head_reducer: str = "median"
 
 
 @dataclass(frozen=True)
 class CorruptionConfig:
-    modes: tuple[str, ...] = ("incidence", "collapse", "composite")
-    prompt_transfer: float = 0.45
-    local_window: int = 4
-    support_keep_fraction: float = 0.55
+    prompt_suppression: float = 0.45
+    locality_strength: float = 1.0
+    local_window: float = 4.0
     concentration_power: float = 1.8
 
 
@@ -48,25 +46,21 @@ class ExperimentConfig:
     output_dir: str
     device: str = "cuda"
     resume: bool = True
-    topology: TopologyConfig = field(default_factory=TopologyConfig)
+    flow: FlowConfig = field(default_factory=FlowConfig)
     corruption: CorruptionConfig = field(default_factory=CorruptionConfig)
     training: TrainConfig = field(default_factory=TrainConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any]) -> "ExperimentConfig":
-        corruption = dict(raw.get("corruption", {}))
-        corruption["modes"] = tuple(
-            corruption.get("modes", CorruptionConfig().modes)
-        )
         return cls(
             attention_root=raw["attention_root"],
             ragtruth_root=raw["ragtruth_root"],
             output_dir=raw["output_dir"],
             device=raw.get("device", "cuda"),
             resume=raw.get("resume", True),
-            topology=TopologyConfig(**raw.get("topology", {})),
-            corruption=CorruptionConfig(**corruption),
+            flow=FlowConfig(**raw.get("flow", {})),
+            corruption=CorruptionConfig(**raw.get("corruption", {})),
             training=TrainConfig(**raw.get("training", {})),
             runtime=RuntimeConfig(**raw.get("runtime", {})),
         )
