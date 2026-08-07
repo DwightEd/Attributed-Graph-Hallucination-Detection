@@ -12,4 +12,4 @@ def test_shared_sparse_loader_is_label_blind_by_default(tmp_path: Path) -> None:
     assert sample.sample_id == "0"
     assert sample.num_channels == 4
     assert sample.response_tokens == 3
-    assert sample.labels is None
+    assert not hasattr(sample, "labels")
