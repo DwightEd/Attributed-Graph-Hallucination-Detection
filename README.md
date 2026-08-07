@@ -12,7 +12,7 @@ patf/augment.py         grounding-erosion counterfactual
 patf/model.py           trajectory ranker
 patf/train.py           label-free ranking training and scoring
 patf/evaluate.py        response-level evaluation
-baselines/cola/         CoLA data/scenario adapter
+baselines/cola/         CoLA RAGTruth data/scenario adapter
 baselines/cola/upstream/model.py
                         byte-identical upstream CoLA model
 configs/patf.json       PATF experiment parameters
@@ -28,7 +28,7 @@ The original graph is unchanged: a token-pair edge exists when any layer/head at
 
 PATF propagates prompt-rooted support **across Transformer layers**. For each layer, all heads and response rows are processed with sparse tensor operations; there is no per-head graph object and no same-layer recursive evidence path.
 
-The CoLA baseline consumes the saved original attributed graphs. It uses only `x` and `edge_index`: `x` is the attention-diagonal node feature and `edge_index` is adapted to the undirected, unweighted adjacency expected by upstream CoLA. `edge_attr` and `edge_mark` are not added to the model. The neural model is copied exactly from `TrustAGI-Lab/CoLA@c2b5273fe6368509dfc558a485764003f5f18ca3`; only the RAGTruth multi-graph data interface and response-level aggregation are adapted.
+The CoLA baseline consumes the saved original attributed graphs. It uses only `x` and `edge_index`: `x` is the attention-diagonal node feature and `edge_index` is adapted to the undirected, unweighted adjacency expected by upstream CoLA. `edge_attr` and `edge_mark` are not added to the model. The neural model is byte-identical to `TrustAGI-Lab/CoLA@c2b5273fe6368509dfc558a485764003f5f18ca3`; only the RAGTruth multi-graph data interface, current-runtime RWR adapter, and response-level aggregation are adapted.
 
 ## Run
 
