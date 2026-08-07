@@ -18,7 +18,6 @@ export OMP_NUM_THREADS="$TORCH_THREADS"
 export MKL_NUM_THREADS="$TORCH_THREADS"
 export OPENBLAS_NUM_THREADS="$TORCH_THREADS"
 export NUMEXPR_NUM_THREADS="$TORCH_THREADS"
-export TOKENIZERS_PARALLELISM=false
 
 mkdir -p "$OUTPUT_DIR"
 printf 'attention_root=%s\nragtruth_root=%s\noutput_dir=%s\n' \
@@ -26,7 +25,7 @@ printf 'attention_root=%s\nragtruth_root=%s\noutput_dir=%s\n' \
 printf 'device=%s epochs=%s workers=%s torch_threads=%s\n' \
   "$DEVICE" "$EPOCHS" "$WORKERS" "$TORCH_THREADS"
 
-"$PYTHON" main.py \
+"$PYTHON" run.py \
   --config configs/patf.json \
   --attention-root "$ATTENTION_ROOT" \
   --ragtruth-root "$RAGTRUTH_ROOT" \
