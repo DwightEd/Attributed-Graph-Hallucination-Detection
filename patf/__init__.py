@@ -1,4 +1,4 @@
 from .config import ExperimentConfig
-from .experiment import run_experiment
+from .flow import FEATURE_NAMES, extract_flow
 
-__all__ = ["ExperimentConfig", "run_experiment"]
+__all__ = ["ExperimentConfig", "FEATURE_NAMES", "extract_flow"]
