@@ -43,6 +43,8 @@ if [[ -n "$LIMIT" ]]; then
   ARGS+=(--limit "$LIMIT")
 fi
 
+mkdir -p "$ANALYSIS_DIR"
+
 printf 'saved_patf_output=%s\n' "$PATF_OUTPUT"
 printf 'ragtruth_root=%s\n' "$RAGTRUTH_ROOT"
 printf 'analysis_dir=%s\n' "$ANALYSIS_DIR"
