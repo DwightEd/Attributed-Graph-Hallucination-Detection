@@ -1,7 +1,7 @@
 from .io import (
     AttentionCacheRecord,
     AttentionSample,
-    SparseRow,
+    SparseLayer,
     discover_attention_cache,
     discover_split,
     load_attention,
@@ -10,7 +10,7 @@ from .io import (
 __all__ = [
     "AttentionCacheRecord",
     "AttentionSample",
-    "SparseRow",
+    "SparseLayer",
     "discover_attention_cache",
     "discover_split",
     "load_attention",
