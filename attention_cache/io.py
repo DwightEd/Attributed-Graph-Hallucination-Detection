@@ -44,6 +44,10 @@ class AttentionSample:
     def response_tokens(self) -> int:
         return self.token_count - self.response_idx
 
+    @property
+    def num_channels(self) -> int:
+        return self.num_layers * self.num_heads
+
     def layer(self, layer: int) -> SparseLayer:
         rows_per_layer = self.num_heads * self.response_tokens
         first_row = layer * rows_per_layer
@@ -79,10 +83,10 @@ def discover_split(cache_root: str | Path, split: str) -> list[Path]:
 
 
 def load_attention(path: str | Path) -> AttentionSample:
-    """Load the label-blind fields used by PATF."""
+    """Load only the label-blind fields used by PATF."""
     path = Path(path).expanduser().resolve()
     record = _load_attention_record(path, device="cpu", mmap=True, include_labels=False)
-    diagonal = torch.as_tensor(record["attention_diagonal"]).float()
+    diagonal = torch.as_tensor(record["attention_diagonal"])
     original = record.get("original_idx")
     return AttentionSample(
         path=path,
@@ -95,7 +99,7 @@ def load_attention(path: str | Path) -> AttentionSample:
         num_layers=int(record["num_attention_layers"]),
         num_heads=int(record["num_attention_heads"]),
         row_ptr=torch.as_tensor(record["response_row_ptr"]).long(),
-        columns=torch.as_tensor(record["response_column_indices"]).long(),
-        values=torch.as_tensor(record["response_values"]).float(),
+        columns=torch.as_tensor(record["response_column_indices"]),
+        values=torch.as_tensor(record["response_values"]),
         diagonal=diagonal,
     )
