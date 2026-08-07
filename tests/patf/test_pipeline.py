@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from patf.config import CorruptionConfig, TopologyConfig, TrainConfig
-from patf.evaluation import evaluate
+from patf.config import CorruptionConfig, FlowConfig, TrainConfig
+from patf.evaluate import evaluate
 from patf.features import load_feature, prepare_features
-from patf.trainer import score_features, train_ranker
+from patf.train import score_features, train_ranker
 
 from .conftest import write_cache
 
@@ -31,14 +31,14 @@ def test_parallel_feature_train_score_and_evaluate(tmp_path: Path) -> None:
             variant=index * 0.05,
         )
 
-    topology = TopologyConfig()
+    flow = FlowConfig()
     corruption = CorruptionConfig()
     train_features = prepare_features(
         sorted(train_dir.glob("*.pt")),
         tmp_path / "features" / "train",
-        topology=topology,
+        flow=flow,
         corruption=corruption,
-        modes=corruption.modes,
+        counterfactual=True,
         resume=True,
         split="train",
         workers=2,
@@ -47,20 +47,21 @@ def test_parallel_feature_train_score_and_evaluate(tmp_path: Path) -> None:
     test_features = prepare_features(
         sorted(test_dir.glob("*.pt")),
         tmp_path / "features" / "test",
-        topology=topology,
+        flow=flow,
         corruption=corruption,
-        modes=(),
+        counterfactual=False,
         resume=True,
         split="test",
         workers=2,
         torch_threads=1,
     )
-    assert len(load_feature(train_features[0])["trajectories"]) == 4
+    assert set(load_feature(train_features[0])["trajectories"]) == {
+        "original", "eroded"
+    }
 
     checkpoint = train_ranker(
         train_features,
         tmp_path / "model",
-        modes=corruption.modes,
         config=TrainConfig(epochs=2, hidden_dim=8, batch_size=4, patience=2),
         device="cpu",
     )
