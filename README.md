@@ -13,8 +13,11 @@ patf/model.py           trajectory ranker
 patf/train.py           label-free ranking training and scoring
 patf/evaluate.py        response-level evaluation
 configs/patf.json       experiment parameters
-scripts/run_patf.sh     PATF shell entry
-run.py                  Python experiment entry
+scripts/run_patf.sh     PATF runner
+scripts/run_charm.sh    supervised CHARM runner
+scripts/prepare_attention_split.sh
+                        attention-cache preparation
+run.py                  Python PATF entry
 ```
 
 The original graph is unchanged: a token-pair edge exists when any layer/head attention is strictly greater than `tau`; all above-threshold channels are retained in `edge_attr`. PATF does not read those persisted graphs.
