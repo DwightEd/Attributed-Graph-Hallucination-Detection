@@ -1,36 +1,30 @@
 # Prompt-Anchored Topology Flow
 
-PATF is a label-free response-level hallucination detector built from saved
-layer/head attention. The repository keeps the supervised attributed-graph
-baseline and PATF as separate methods over one shared attention-cache API.
+PATF is a label-free response-level hallucination detector built from saved LLM attention. The supervised CHARM baseline and PATF share only the formal attention-cache loader; their graph definitions are separate.
 
 ## Structure
 
 ```text
 attention_cache/io.py   shared sparse-CSR cache access
 original/               original threshold-union attributed graph + CHARM
-patf/                   prompt-anchored topology method
-configs/patf.json       method, training, and runtime parameters
-scripts/run_patf.sh     one experiment entry
+patf/flow.py            cross-layer prompt-rooted attention flow
+patf/augment.py         grounding-erosion counterfactual
+patf/model.py           trajectory ranker
+patf/train.py           label-free ranking training and scoring
+patf/evaluate.py        response-level evaluation
+configs/patf.json       experiment parameters
+scripts/run_patf.sh     PATF shell entry
+run.py                  Python experiment entry
 ```
 
-The original graph and PATF do not share graph construction:
+The original graph is unchanged: a token-pair edge exists when any layer/head attention is strictly greater than `tau`; all above-threshold channels are retained in `edge_attr`. PATF does not read those persisted graphs.
 
-- `original/ragtruth_graph.py`: a token-pair edge is created when **any**
-  layer/head value is strictly greater than `tau`; `edge_attr` keeps all
-  above-threshold channels and zeros the rest. This is threshold union, not
-  max-value selection and not top-k.
-- `patf/topology.py`: no static attributed graph is saved. Each layer/head is
-  analysed separately, then aggregated into a `[layers, 30]` topology
-  trajectory.
+PATF propagates prompt-rooted support **across Transformer layers**. For each layer, all heads and response rows are processed with sparse tensor operations; there is no per-head graph object and no same-layer recursive evidence path.
 
-Only the cache schema, sample identity, and CSR row access are shared through
-`attention_cache/io.py`.
-
-## Run PATF
+## Run
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 WORKERS=8 bash scripts/run_patf.sh
+CUDA_VISIBLE_DEVICES=0 WORKERS=8 TORCH_THREADS=1 bash scripts/run_patf.sh
 ```
 
 Useful overrides:
@@ -43,28 +37,4 @@ DEVICE=cuda EPOCHS=80 WORKERS=8 TORCH_THREADS=1 \
 bash scripts/run_patf.sh
 ```
 
-`WORKERS` controls sample-level multiprocessing. Each worker uses
-`TORCH_THREADS=1` by default to avoid CPU oversubscription. For shared storage,
-start with 4 or 8 workers; increasing beyond the available I/O bandwidth may
-slow the run.
-
-## Outputs
-
-```text
-output/
-  status.json
-  config.json
-  run.log
-  features/train/*.features.pt
-  model/model.pt
-  model/history.json
-  features/test/*.features.pt
-  predictions.jsonl
-  evaluation.json
-```
-
-Feature files are written atomically per sample and reused when both the source
-file and method configuration match. During the first stage `model/` remains
-empty because the ranker is trained only after all training trajectories are
-available; progress is visible in `features/train/`, `status.json`, and
-`run.log`.
+Feature extraction is sample-parallel and resumable. Completed `features/*.features.pt` files are reused when both the source file and method configuration match.
