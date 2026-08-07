@@ -12,10 +12,10 @@ import torch
 
 from attention_cache import load_attention
 
-from .config import CorruptionConfig, TopologyConfig
-from .topology import FEATURE_NAMES, extract_trajectories
+from .config import CorruptionConfig, FlowConfig
+from .flow import FEATURE_NAMES, extract_flow
 
-FEATURE_SCHEMA = "patf-feature-v2"
+FEATURE_SCHEMA = "patf-cross-layer-flow-v1"
 
 
 def _source_signature(path: Path) -> tuple[int, int]:
@@ -49,9 +49,9 @@ def _is_current(
 def _extract_one(
     attention_path: str,
     feature_path: str,
-    topology: TopologyConfig,
+    flow: FlowConfig,
     corruption: CorruptionConfig,
-    modes: tuple[str, ...],
+    counterfactual: bool,
     feature_config: dict[str, object],
     torch_threads: int,
 ) -> tuple[str, float]:
@@ -60,11 +60,11 @@ def _extract_one(
     source = Path(attention_path)
     destination = Path(feature_path)
     sample = load_attention(source)
-    trajectories = extract_trajectories(
+    trajectories = extract_flow(
         sample,
-        topology=topology,
+        flow=flow,
         corruption=corruption,
-        modes=modes,
+        counterfactual=counterfactual,
     )
     _save_atomic(
         {
@@ -88,22 +88,21 @@ def prepare_features(
     paths: Iterable[Path],
     output_dir: str | Path,
     *,
-    topology: TopologyConfig,
+    flow: FlowConfig,
     corruption: CorruptionConfig,
-    modes: tuple[str, ...],
+    counterfactual: bool,
     resume: bool,
     split: str,
     workers: int = 1,
     torch_threads: int = 1,
 ) -> list[Path]:
-    """Extract sample features in parallel and cache each sample atomically."""
     paths = list(paths)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     feature_config: dict[str, object] = {
-        "topology": asdict(topology),
-        "corruption": asdict(corruption),
-        "modes": modes,
+        "flow": asdict(flow),
+        "corruption": asdict(corruption) if counterfactual else None,
+        "counterfactual": counterfactual,
     }
     feature_paths = [
         output_dir / f"{attention_path.stem}.features.pt"
@@ -133,23 +132,22 @@ def prepare_features(
 
     arguments = [
         (
-            str(attention_path),
-            str(feature_path),
-            topology,
+            str(source),
+            str(destination),
+            flow,
             corruption,
-            modes,
+            counterfactual,
             feature_config,
             max(1, torch_threads),
         )
-        for attention_path, feature_path in pending
+        for source, destination in pending
     ]
 
     if workers <= 1:
         for index, argument in enumerate(arguments, 1):
             name, elapsed = _extract_one(*argument)
             print(
-                f"[{split} features] {index}/{len(arguments)} {name} "
-                f"{elapsed:.1f}s",
+                f"[{split} features] {index}/{len(arguments)} {name} {elapsed:.1f}s",
                 flush=True,
             )
         return feature_paths
@@ -159,15 +157,11 @@ def prepare_features(
         max_workers=min(workers, len(arguments)),
         mp_context=context,
     ) as executor:
-        futures = {
-            executor.submit(_extract_one, *argument): argument[0]
-            for argument in arguments
-        }
+        futures = [executor.submit(_extract_one, *argument) for argument in arguments]
         for index, future in enumerate(as_completed(futures), 1):
             name, elapsed = future.result()
             print(
-                f"[{split} features] {index}/{len(arguments)} {name} "
-                f"{elapsed:.1f}s",
+                f"[{split} features] {index}/{len(arguments)} {name} {elapsed:.1f}s",
                 flush=True,
             )
     return feature_paths
